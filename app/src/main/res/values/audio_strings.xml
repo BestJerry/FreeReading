@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="audio_channel">听书播放</string>
+    <string name="audio_preparing">正在准备离线语音…</string>
+    <string name="audio_start_failed">无法启动听书，请返回应用后重试。</string>
+    <string name="audio_tts_unavailable">系统语音引擎不可用，请安装或启用语音引擎。</string>
+    <string name="audio_voice_missing">没有可用的%1$s离线声音，请在系统语音设置中安装对应语言的离线语音包。</string>
+    <string name="audio_tts_failed">语音合成失败，请检查离线语音包后重试。</string>
+    <string name="audio_timeout">语音引擎响应超时，请检查系统语音设置后重试。</string>
+    <string name="audio_sentence_too_long">这一段超出系统语音引擎的长度限制。</string>
+    <string name="audio_empty_book">这本书没有可朗读的文字。</string>
+    <string name="audio_playback_failed">音频播放失败，请重试。</string>
+    <string name="audio_progress_failed">暂时无法保存听书进度，请检查可用存储空间。</string>
+    <string name="audio_cache_failed">无法保存语音缓存，请检查可用存储空间后重试。</string>
+    <string name="audio_backward">后退15秒</string>
+    <string name="audio_forward">快进15秒</string>
+    <string name="audio_notification_title">FreeReading 听书</string>
+    <string name="audio_stop">停止听书</string>
+</resources>

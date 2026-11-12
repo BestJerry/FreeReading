@@ -1,0 +1,11 @@
+<resources>
+    <style name="Base.Theme.FreeReading" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">#F7F5EF</item>
+        <item name="android:colorAccent">#456454</item>
+        <item name="android:statusBarColor">#F7F5EF</item>
+        <item name="android:navigationBarColor">#456454</item>
+    </style>
+    <style name="Theme.FreeReading" parent="Base.Theme.FreeReading" />
+</resources>

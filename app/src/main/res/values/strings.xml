@@ -1,0 +1,37 @@
+<resources>
+    <string name="app_name">FreeReading</string>
+    <string name="library_title">我的书架</string>
+    <string name="library_subtitle">每一本书，都是一段自己的时间。</string>
+    <string name="library_eyebrow">READ AT YOUR OWN PACE</string>
+    <string name="library_hero">让阅读，慢下来。</string>
+    <string name="import_book">导入 EPUB</string>
+    <string name="importing_book">正在整理书籍…</string>
+    <string name="empty_title">下一段旅程，从一本书开始</string>
+    <string name="empty_description">导入本地 EPUB，随时阅读，也能闭上眼睛听。</string>
+    <string name="book_count">%1$d 本藏书</string>
+    <string name="offline_badge">离线阅读 · 系统听书</string>
+    <string name="open_book">开始阅读</string>
+    <string name="unknown_author">佚名</string>
+    <string name="voice_settings">语音设置</string>
+    <string name="voice_settings_description">听书使用手机的系统语音引擎。请先在系统设置中安装对应语言的离线语音包。</string>
+    <string name="open_voice_settings">打开系统语音设置</string>
+    <string name="close">关闭</string>
+    <string name="cancel">取消</string>
+    <string name="delete_book">移除书籍</string>
+    <string name="delete_book_message">移除《%1$s》及它的阅读进度和语音缓存？原始导入文件仍保留在原位置。</string>
+    <string name="delete">移除</string>
+    <string name="operation_failed">操作未完成</string>
+    <string name="import_failed">无法导入这本书，请确认它是完整、无 DRM 的 EPUB 文件。</string>
+    <string name="import_success">已导入《%1$s》</string>
+    <string name="more_options">书籍操作</string>
+    <string name="currently_listening">正在听</string>
+    <string name="preparing_audio">正在准备语音…</string>
+    <string name="pause_playback">暂停听书</string>
+    <string name="resume_playback">继续听书</string>
+    <string name="library_load_failed">书架暂时无法读取，请重新打开应用。</string>
+    <string name="external_import_title">正在导入书籍</string>
+    <string name="external_import_description">导入完成后将直接打开阅读。</string>
+    <string name="external_import_invalid">无法读取要导入的书籍，请从文件管理器重新打开或分享 EPUB 文件。</string>
+    <string name="external_import_back">返回</string>
+    <string name="retry">重试</string>
+</resources>
