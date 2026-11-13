@@ -97,16 +97,18 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             FreeReadingTheme {
-                LibraryScreen(model) { bookId ->
-                    startActivity(ReaderActivity.intent(this, bookId))
-                }
+                LibraryScreen(
+                    model = model,
+                    openBook = { startActivity(ReaderActivity.intent(this, it)) },
+                    openListening = { startActivity(ReaderActivity.intent(this, it, openPlayer = true)) },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit) {
+private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, openListening: (String) -> Unit) {
     val books by model.books.collectAsStateWithLifecycle()
     val busy by model.busy.collectAsStateWithLifecycle()
     val error by model.error.collectAsStateWithLifecycle()
@@ -126,7 +128,7 @@ private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit) {
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             if (playback.bookId != null) {
-                NowPlaying(playback, openBook)
+                NowPlaying(playback, openListening)
             }
         },
     ) { insets ->

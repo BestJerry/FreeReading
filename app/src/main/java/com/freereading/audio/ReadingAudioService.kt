@@ -51,6 +51,7 @@ class ReadingAudioService : MediaSessionService() {
     private lateinit var session: MediaSession
     private lateinit var speech: OfflineSpeechCache
     private var book: SpeechBook? = null
+    private var chapterProgressIndex: ChapterProgressIndex? = null
     private var generation = 0L
     private var transitionToken: Long? = null
     private var operation: Job? = null
@@ -77,6 +78,7 @@ class ReadingAudioService : MediaSessionService() {
         player.addListener(object : Player.Listener {
             override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
                 PlaybackHub.persistSpeed(this@ReadingAudioService, playbackParameters.speed.coerceIn(0.5f, 2f))
+                PlaybackHub.publish(PlaybackHub.state.value.copy(speed = playbackParameters.speed))
             }
             override fun onEvents(player: Player, events: Player.Events) {
                 refreshSnapshot()
@@ -204,7 +206,10 @@ class ReadingAudioService : MediaSessionService() {
             if (loaded.sentences.isEmpty()) throw AudioFailure(getString(R.string.audio_empty_book))
             val saved = if (index < 0) withContext(Dispatchers.IO) { repository.progress(id) } else null
             ensureActiveGeneration(token)
+            val progressIndex = withContext(Dispatchers.IO) { ChapterProgressIndex(loaded.sentences) }
+            ensureActiveGeneration(token)
             book = loaded
+            chapterProgressIndex = progressIndex
             clips.clear()
             val target = (saved?.sentenceIndex ?: index).coerceIn(0, loaded.sentences.lastIndex)
             val position = (saved?.audioOffsetMs ?: offsetMs).coerceAtLeast(0)
@@ -282,7 +287,6 @@ class ReadingAudioService : MediaSessionService() {
             error = null, needsVoiceData = false))
         player.stop()
         player.clearMediaItems()
-        speech.protect(emptyList())
         try { showPreparingNotification() }
         catch (_: RuntimeException) {
             reportFailure(AudioFailure(getString(R.string.audio_start_failed)))
@@ -293,6 +297,7 @@ class ReadingAudioService : MediaSessionService() {
                 oldOperation?.join()
                 oldPrefetch?.join()
                 ensureActiveGeneration(token)
+                speech.protect(emptyList())
                 block(token)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -371,25 +376,35 @@ class ReadingAudioService : MediaSessionService() {
 
     private fun refreshSnapshot() {
         val currentBook = book ?: return
-        if (transitionToken != null) return
+        // A failed transition leaves no media item. Its zero player position is not
+        // authoritative; retain the requested cursor for retry and progress persistence.
+        if (transitionToken != null || player.mediaItemCount == 0) return
         val index = currentIndex().coerceIn(0, currentBook.sentences.lastIndex)
         val sentence = currentBook.sentences[index]
+        val position = player.currentPosition.coerceAtLeast(0)
+        val duration = clips[index]?.durationMs ?: 0
+        val chapter = chapterProgressIndex?.at(index, position, duration)
         val old = PlaybackHub.state.value
         PlaybackHub.publish(old.copy(bookId = currentBook.book.id, bookTitle = currentBook.book.title,
             sentenceIndex = index, sentenceCount = currentBook.sentences.size,
             chapterTitle = sentence.chapterTitle, text = sentence.text,
-            positionMs = player.currentPosition.coerceAtLeast(0),
-            durationMs = clips[index]?.durationMs ?: 0,
+            positionMs = position, durationMs = duration,
+            chapterProgress = chapter?.fraction ?: 0f,
+            chapterSentenceCount = chapter?.sentenceCount ?: 0,
             isPlaying = player.isPlaying, isPreparing = player.playbackState == Player.STATE_BUFFERING,
             speed = player.playbackParameters.speed))
     }
 
     private fun publishPreparing(currentBook: SpeechBook, index: Int, positionMs: Long) {
         val sentence = currentBook.sentences[index]
+        val duration = clips[index]?.durationMs ?: 0
+        val chapter = chapterProgressIndex?.at(index, positionMs, duration)
         PlaybackHub.publish(PlaybackHub.state.value.copy(bookId = currentBook.book.id,
             bookTitle = currentBook.book.title, sentenceIndex = index,
             sentenceCount = currentBook.sentences.size, chapterTitle = sentence.chapterTitle,
-            text = sentence.text, positionMs = positionMs.coerceAtLeast(0), durationMs = 0,
+            text = sentence.text, positionMs = positionMs.coerceAtLeast(0), durationMs = duration,
+            chapterProgress = chapter?.fraction ?: 0f,
+            chapterSentenceCount = chapter?.sentenceCount ?: 0,
             isPreparing = true, isPlaying = false, error = null, needsVoiceData = false))
     }
 
@@ -445,6 +460,7 @@ class ReadingAudioService : MediaSessionService() {
             if (progress != null) runCatching { persist(progress) }
             if (generation != token) return@launch
             clips.clear()
+            chapterProgressIndex = null
             speech.protect(emptyList())
             transitionToken = null
             PlaybackHub.publish(PlaybackSnapshot(speed = player.playbackParameters.speed))

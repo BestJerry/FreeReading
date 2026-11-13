@@ -1,9 +1,5 @@
 package com.freereading.audio
 
-/** Audio transitions may publish an unknown duration; UI semantics require a finite fraction. */
-internal val PlaybackSnapshot.progressFraction: Float
-    get() = when {
-        durationMs <= 0L || positionMs <= 0L -> 0f
-        positionMs >= durationMs -> 1f
-        else -> (positionMs.toDouble() / durationMs.toDouble()).toFloat().coerceIn(0f, 1f)
-    }
+/** Keep delayed UI semantics safe even while a new playback snapshot replaces the old one. */
+internal val PlaybackSnapshot.chapterProgressFraction: Float
+    get() = if (chapterProgress.isFinite()) chapterProgress.coerceIn(0f, 1f) else 0f

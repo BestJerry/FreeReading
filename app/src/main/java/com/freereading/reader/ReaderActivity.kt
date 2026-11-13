@@ -2,9 +2,9 @@
 
 package com.freereading.reader
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.content.ActivityNotFoundException
 import android.net.Uri
 import android.os.Bundle
 import android.view.ActionMode
@@ -12,11 +12,10 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,30 +24,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Headphones
-import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.IconButtonDefaults
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -66,6 +52,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -77,7 +65,6 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.withStateAtLeast
 import com.freereading.ReadingApplication
 import com.freereading.audio.PlaybackHub
-import com.freereading.audio.progressFraction
 import com.freereading.data.ReadingProgress
 import com.freereading.data.SpeechBook
 import com.freereading.data.SpeechSentence
@@ -134,18 +121,20 @@ class ReaderActivity : FragmentActivity() {
     private var openingError by mutableStateOf<String?>(null)
     private var showContents by mutableStateOf(false)
     private var showAppearance by mutableStateOf(false)
-    private var showSpeed by mutableStateOf(false)
+    private var showReadingControls by mutableStateOf(false)
+    private var showListening by mutableStateOf(false)
     private var followAudio by mutableStateOf(true)
     private var fontScale by mutableStateOf(1.15f)
     private var pageStyle by mutableStateOf("paper")
     private var scroll by mutableStateOf(false)
     private var loadJob: Job? = null
-    private lateinit var root: LinearLayout
+    private lateinit var root: ReaderSurfaceLayout
     private lateinit var documentFrame: FrameLayout
     private lateinit var openingOverlay: ComposeView
     private val fragmentContainerId = View.generateViewId()
     private var restoredLocator: String? = null
     private var resumableProgress: ReadingProgress? = null
+    private var pendingStoppedProgress: ReadingProgress? = null
     private var lastAnchorChapter: Int? = null
     private var chapterAnchors: List<SentenceLocatorMatcher.Anchor> = emptyList()
     private var readingOrderHrefs: List<String> = emptyList()
@@ -174,6 +163,16 @@ class ReaderActivity : FragmentActivity() {
             runCatching { ReadingPlaybackIntent.valueOf(it) }.getOrNull()
         } ?: ReadingPlaybackIntent.CONTINUE_AUDIO
         requestedReadingStart = savedInstanceState?.getString(STATE_READING_START)?.let(::parseLocator)
+        showReadingControls = savedInstanceState?.getBoolean(STATE_READING_CONTROLS, false) ?: false
+        showListening = savedInstanceState?.getBoolean(STATE_LISTENING)
+            ?: intent.getBooleanExtra(EXTRA_OPEN_PLAYER, false)
+        pendingStoppedProgress = savedInstanceState?.getBundle(STATE_STOPPED_PROGRESS)
+            ?.takeIf { it.getString("book_id") == bookId }
+            ?.let {
+                ReadingProgress(bookId, it.getString("locator"), it.getInt("sentence"),
+                    it.getLong("offset").coerceAtLeast(0), it.getLong("updated"))
+            }
+        resumableProgress = pendingStoppedProgress
         // Readium Fragments retain a Publication supplied by their factory. Rebuild them after
         // reopening the local file instead of restoring a Fragment with a closed/missing book.
         super.onCreate(null)
@@ -187,8 +186,14 @@ class ReaderActivity : FragmentActivity() {
 
     private fun buildViews() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        documentFrame = FrameLayout(this).apply {
+            id = fragmentContainerId
+            // Reserve only the thin reading footer, in both reading/menu states.
+            setPadding(0, 0, 0, (28 * resources.displayMetrics.density).toInt())
+        }
+        openingOverlay = composeView { OpeningState() }
+        val chrome = composeView { ReaderSurfaces() }
+        root = ReaderSurfaceLayout(this, documentFrame, openingOverlay, chrome).apply {
             setBackgroundColor(paper.toArgb())
         }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
@@ -196,14 +201,6 @@ class ReaderActivity : FragmentActivity() {
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
-        root.addView(composeView { ReaderHeader() }, LinearLayout.LayoutParams(-1, -2))
-        val body = FrameLayout(this)
-        documentFrame = FrameLayout(this).apply { id = fragmentContainerId }
-        body.addView(documentFrame, FrameLayout.LayoutParams(-1, -1))
-        openingOverlay = composeView { OpeningState() }
-        body.addView(openingOverlay, FrameLayout.LayoutParams(-1, -1))
-        root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(composeView { ReaderAudioControls() }, LinearLayout.LayoutParams(-1, -2))
         setContentView(root)
         updateSystemBars()
     }
@@ -248,10 +245,11 @@ class ReaderActivity : FragmentActivity() {
         publication = opened
         readingOrderHrefs = opened.readingOrder.map { it.url().removeFragment().toString() }
         val audio = PlaybackHub.state.value
-        resumableProgress = saved.takeUnless {
-            audio.bookId == bookId || readingPlaybackIntent == ReadingPlaybackIntent.FROM_READING_LOCATION
-        }
+        resumableProgress = resolveResumeProgress(book, saved, pendingStoppedProgress,
+            audio.bookId, readingPlaybackIntent)
+        val stoppedLocator = resumableProgress?.takeIf { pendingStoppedProgress != null }?.locatorJson
         val initial = when {
+            followAudio && stoppedLocator != null -> stoppedLocator
             followAudio && audio.bookId == bookId -> book.sentences.getOrNull(audio.sentenceIndex)?.locatorJson
             restoredLocator != null -> restoredLocator
             else -> saved.locatorJson
@@ -306,7 +304,10 @@ class ReaderActivity : FragmentActivity() {
                         markManualNavigation()
                         fragment.goForward(animated = true)
                     }
-                    else -> false
+                    else -> {
+                        showReadingControls = !showReadingControls
+                        true
+                    }
                 }
             }
 
@@ -442,23 +443,28 @@ class ReaderActivity : FragmentActivity() {
         }
 
     private fun markManualNavigation() {
-        readingStartJob?.cancel()
-        readingNavigationRevision += 1
+        showReadingControls = false
+        cancelReadingStart()
         readingPlaybackIntent = ReadingPlaybackIntent.FROM_READING_LOCATION
         requestedReadingStart = null
-        visibleTextSnapshot = null
         followAudio = false
         resumableProgress = null
+        pendingStoppedProgress = null
     }
 
     private fun followCurrentAudio() {
-        readingStartJob?.cancel()
-        readingNavigationRevision += 1
+        cancelReadingStart()
         readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
         requestedReadingStart = null
-        visibleTextSnapshot = null
         followAudio = true
         synchronizeAudio()
+    }
+
+    private fun cancelReadingStart() {
+        readingStartJob?.cancel()
+        readingStartJob = null
+        readingNavigationRevision += 1
+        visibleTextSnapshot = null
     }
 
     private fun anchorsFor(locator: Locator): List<SentenceLocatorMatcher.Anchor> {
@@ -515,8 +521,9 @@ class ReaderActivity : FragmentActivity() {
     private fun playFromVisibleParagraph() = playFromReadingLocation(null)
 
     private fun playFromReadingLocation(requested: Locator? = requestedReadingStart) {
-        resumableProgress = null
         val fragment = navigator ?: return
+        resumableProgress = null
+        pendingStoppedProgress = null
         val revision = readingNavigationRevision
         readingStartJob?.cancel()
         readingStartJob = lifecycleScope.launch {
@@ -544,8 +551,8 @@ class ReaderActivity : FragmentActivity() {
     }
 
     private fun playFromLocator(locator: Locator) {
-        readingStartJob?.cancel()
         resumableProgress = null
+        pendingStoppedProgress = null
         val sentence = sentenceAt(locator)
         if (sentence == null) {
             toast("当前位置暂无可朗读文字，请从目录选择正文。")
@@ -567,6 +574,7 @@ class ReaderActivity : FragmentActivity() {
             playFromReadingLocation()
         } else {
             resumableProgress = null
+            pendingStoppedProgress = null
             readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
             requestedReadingStart = null
             followAudio = true
@@ -585,13 +593,18 @@ class ReaderActivity : FragmentActivity() {
 
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
             if (item.itemId != SELECTION_LISTEN_ID) return false
-            lifecycleScope.launch {
-                val fragment = navigator ?: return@launch
-                val locator = queryNavigatorLocator { fragment.currentSelection()?.locator }
-                    ?: visibleTextAnchor(fragment, fragment.currentLocator.value)
-                if (locator != null) playFromLocator(locator)
-                fragment.clearSelection()
-                mode.finish()
+            readingStartJob?.cancel()
+            val revision = readingNavigationRevision
+            val fragment = navigator ?: return true
+            readingStartJob = lifecycleScope.launch {
+                try {
+                    val locator = queryNavigatorLocator { fragment.currentSelection()?.locator }
+                        ?: visibleTextAnchor(fragment, fragment.currentLocator.value)
+                    if (revision == readingNavigationRevision && locator != null) playFromLocator(locator)
+                } finally {
+                    if (fragment.isAdded && fragment.view != null) fragment.clearSelection()
+                    mode.finish()
+                }
             }
             return true
         }
@@ -635,6 +648,17 @@ class ReaderActivity : FragmentActivity() {
         outState.putBoolean(STATE_FOLLOW, followAudio)
         outState.putString(STATE_PLAYBACK_INTENT, readingPlaybackIntent.name)
         outState.putString(STATE_READING_START, requestedReadingStart?.toJSON()?.toString())
+        outState.putBoolean(STATE_READING_CONTROLS, showReadingControls)
+        outState.putBoolean(STATE_LISTENING, showListening)
+        pendingStoppedProgress?.let { progress ->
+            outState.putBundle(STATE_STOPPED_PROGRESS, Bundle().apply {
+                putString("book_id", progress.bookId)
+                putString("locator", progress.locatorJson)
+                putInt("sentence", progress.sentenceIndex)
+                putLong("offset", progress.audioOffsetMs)
+                putLong("updated", progress.updatedAt)
+            })
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -660,54 +684,92 @@ class ReaderActivity : FragmentActivity() {
     }
 
     @Composable
-    private fun ReaderHeader() {
-        Column(Modifier.fillMaxWidth().background(paper)) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = ::finish) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回书架", tint = ink)
-                }
-                Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
-                    Text("FREE READING", color = muted, fontSize = 10.sp, letterSpacing = 2.sp)
-                    Text(
-                        speechBook?.book?.title ?: "正在打开书籍",
-                        color = ink,
-                        fontFamily = FontFamily.Serif,
-                        fontSize = 19.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                TextButton(onClick = { showAppearance = true }, enabled = navigator != null) {
-                    Text("Aa", color = ink, fontFamily = FontFamily.Serif, fontSize = 21.sp)
-                }
-                IconButton(onClick = { showContents = true }, enabled = navigator != null) {
-                    Icon(Icons.AutoMirrored.Filled.List, contentDescription = "打开目录", tint = ink)
-                }
-            }
-            Row(
-                Modifier.fillMaxWidth().padding(start = 23.dp, end = 23.dp, bottom = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    visibleLocator?.title?.takeIf(String::isNotBlank) ?: "让阅读慢下来",
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    color = muted,
-                    fontSize = 11.sp,
-                )
-                visibleLocator?.locations?.totalProgression?.let {
-                    Text("${(it * 100).toInt()}%", color = muted, fontSize = 11.sp)
-                }
-            }
-            HorizontalDivider(color = ink.copy(alpha = 0.08f))
+    private fun ReaderSurfaces() {
+        val audio by PlaybackHub.state.collectAsStateWithLifecycle()
+        val activeBook = audio.bookId == bookId
+        val book = speechBook?.book
+        val title = book?.title ?: audio.bookTitle.takeIf { activeBook && it.isNotBlank() } ?: "正在打开书籍"
+        val enabled = navigator != null && !loading
+        BackHandler(enabled = showReadingControls && !showListening && !showContents && !showAppearance) {
+            showReadingControls = false
         }
+        ReaderChrome(
+            title = title,
+            chapter = visibleLocator?.title?.takeIf(String::isNotBlank) ?: "点按中央打开阅读菜单",
+            readingProgress = visibleLocator?.locations?.totalProgression?.toFloat(),
+            controlsVisible = showReadingControls,
+            hasAudio = activeBook,
+            isPlaying = activeBook && audio.isPlaying,
+            isPreparing = activeBook && audio.isPreparing,
+            enabled = enabled,
+            paper = paper, ink = ink, accent = accent,
+            onBack = ::finish,
+            onContents = { showReadingControls = false; showContents = true },
+            onAppearance = { showReadingControls = false; showAppearance = true },
+            onListen = { showReadingControls = false; showListening = true },
+            onToggleControls = { showReadingControls = !showReadingControls },
+        )
         if (showContents) ContentsDialog()
         if (showAppearance) AppearanceDialog()
+        if (showListening) {
+            Dialog(
+                onDismissRequest = { showListening = false },
+                properties = DialogProperties(
+                    usePlatformDefaultWidth = false,
+                    decorFitsSystemWindows = false,
+                    dismissOnClickOutside = false,
+                ),
+            ) {
+                ListeningPlayerScreen(
+                    bookTitle = title, author = book?.author.orEmpty(), coverPath = book?.coverPath,
+                    snapshot = audio, activeBook = activeBook, enabled = enabled, followAudio = followAudio,
+                    paper = paper, ink = ink, accent = accent,
+                    onClose = { showListening = false },
+                    onToggle = ::toggleListening,
+                    onSeek = { PlaybackHub.seekBy(this, it) },
+                    onSpeed = { PlaybackHub.setSpeed(this, it) },
+                    onFromReading = ::playFromVisibleParagraph,
+                    onFollowToggle = { if (followAudio) followAudio = false else followCurrentAudio() },
+                    onLocate = { showListening = false; showReadingControls = false; followCurrentAudio() },
+                    onStop = ::stopListening,
+                    onVoiceSettings = { PlaybackHub.openVoiceSettings(this) },
+                )
+            }
+        }
+    }
+
+    private fun toggleListening() {
+        // The newest transport action supersedes a pending DOM/selection lookup.
+        cancelReadingStart()
+        val audio = PlaybackHub.state.value
+        if (pendingStoppedProgress == null && (navigator == null || loading) && audio.bookId == bookId) {
+            // Existing audio remains usable while Readium reopens after recreation.
+            PlaybackHub.toggle(this)
+            return
+        }
+        if (pendingStoppedProgress != null) {
+            if (readingPlaybackIntent == ReadingPlaybackIntent.FROM_READING_LOCATION) {
+                playFromReadingLocation()
+            } else {
+                resumeOrPlayFromPage()
+            }
+            return
+        }
+        when (primaryPlaybackAction(audio, bookId, readingPlaybackIntent)) {
+            PrimaryPlaybackAction.PAUSE_OR_TOGGLE, PrimaryPlaybackAction.RESUME_AUDIO -> PlaybackHub.toggle(this)
+            PrimaryPlaybackAction.START_FROM_READING_LOCATION -> playFromReadingLocation()
+            PrimaryPlaybackAction.RESUME_SAVED_OR_READING -> resumeOrPlayFromPage()
+        }
+    }
+
+    private fun stopListening() {
+        cancelReadingStart()
+        showListening = false
+        val audio = PlaybackHub.state.value
+        if (audio.bookId != bookId) return
+        pendingStoppedProgress = stoppedPlaybackProgress(bookId, audio, speechBook?.sentences)
+        resumableProgress = pendingStoppedProgress
+        PlaybackHub.stop(this)
     }
 
     @Composable
@@ -729,136 +791,6 @@ class ReaderActivity : FragmentActivity() {
                 Spacer(Modifier.height(24.dp))
                 Button(onClick = ::openBook) { Text("重新尝试") }
                 TextButton(onClick = ::finish) { Text("返回书架") }
-            }
-        }
-    }
-
-    @Composable
-    private fun ReaderAudioControls() {
-        val audio by PlaybackHub.state.collectAsStateWithLifecycle()
-        val activeBook = audio.bookId == bookId
-        val currentSentence = speechBook?.sentences?.getOrNull(audio.sentenceIndex)?.takeIf { activeBook }
-        Column(Modifier.fillMaxWidth().background(paper)) {
-            HorizontalDivider(color = ink.copy(alpha = 0.09f))
-            Row(
-                Modifier.fillMaxWidth().padding(start = 21.dp, end = 13.dp, top = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(Icons.Default.Headphones, contentDescription = null, tint = accent, modifier = Modifier.size(15.dp))
-                Spacer(Modifier.width(7.dp))
-                Text(
-                    if (activeBook && audio.isPreparing) "正在准备语音…" else if (activeBook) "听到这里" else "听书",
-                    color = muted,
-                    fontSize = 11.sp,
-                )
-                Spacer(Modifier.weight(1f))
-                if (activeBook) {
-                    TextButton(onClick = { if (followAudio) followAudio = false else followCurrentAudio() }) {
-                        Text(if (followAudio) "已跟随原文" else "跟随原文", color = accent, fontSize = 11.sp)
-                    }
-                    IconButton(onClick = ::followCurrentAudio, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.MyLocation, "定位正在朗读的原文", tint = accent, modifier = Modifier.size(19.dp))
-                    }
-                }
-            }
-            if (currentSentence != null) {
-                Text(
-                    currentSentence.text,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 2.dp),
-                    color = muted,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box {
-                    TextButton(onClick = { showSpeed = true }, enabled = activeBook) {
-                        Text(String.format(Locale.ROOT, "%.2g×", audio.speed), color = if (activeBook) accent else muted)
-                    }
-                    DropdownMenu(expanded = showSpeed, onDismissRequest = { showSpeed = false }) {
-                        listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f).forEach { speed ->
-                            DropdownMenuItem(
-                                text = { Text("${speed}×") },
-                                onClick = { PlaybackHub.setSpeed(this@ReaderActivity, speed); showSpeed = false },
-                            )
-                        }
-                    }
-                }
-                TextButton(onClick = { PlaybackHub.seekBy(this@ReaderActivity, -15_000) }, enabled = activeBook) {
-                    Text("−15s", color = if (activeBook) ink else muted, fontSize = 15.sp)
-                }
-                FilledIconButton(
-                    onClick = {
-                        when (primaryPlaybackAction(audio, bookId, readingPlaybackIntent)) {
-                            PrimaryPlaybackAction.PAUSE_OR_TOGGLE, PrimaryPlaybackAction.RESUME_AUDIO ->
-                                PlaybackHub.toggle(this@ReaderActivity)
-                            PrimaryPlaybackAction.START_FROM_READING_LOCATION -> playFromReadingLocation()
-                            PrimaryPlaybackAction.RESUME_SAVED_OR_READING -> resumeOrPlayFromPage()
-                        }
-                    },
-                    enabled = navigator != null,
-                    modifier = Modifier.size(54.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = accent, contentColor = paper),
-                ) {
-                    if (activeBook && audio.isPreparing) {
-                        CircularProgressIndicator(color = paper, modifier = Modifier.size(23.dp), strokeWidth = 2.dp)
-                    } else {
-                        Icon(
-                            if (activeBook && audio.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            if (activeBook && audio.isPlaying) "暂停听书" else "开始或继续听书",
-                            modifier = Modifier.size(29.dp),
-                        )
-                    }
-                }
-                TextButton(onClick = { PlaybackHub.seekBy(this@ReaderActivity, 15_000) }, enabled = activeBook) {
-                    Text("+15s", color = if (activeBook) ink else muted, fontSize = 15.sp)
-                }
-                TextButton(onClick = ::playFromVisibleParagraph, enabled = navigator != null) {
-                    Text("从此段听", color = accent, fontSize = 11.sp)
-                }
-            }
-            if (activeBook && audio.durationMs > 0) {
-                LinearProgressIndicator(
-                    progress = { audio.progressFraction },
-                    modifier = Modifier.fillMaxWidth().height(2.dp),
-                    color = accent.copy(alpha = 0.5f),
-                    trackColor = ink.copy(alpha = 0.05f),
-                )
-            }
-            if (activeBook && audio.error != null) {
-                Column(Modifier.padding(horizontal = 22.dp, vertical = 8.dp)) {
-                    Text(audio.error.orEmpty(), color = if (pageStyle == "dark") Color(0xFFEAB6A1) else Color(0xFF965742), fontSize = 12.sp)
-                    if (audio.needsVoiceData) {
-                        TextButton(onClick = { PlaybackHub.openVoiceSettings(this@ReaderActivity) }) {
-                            Text("安装或设置离线语音")
-                        }
-                    }
-                }
-            }
-            if (activeBook) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("长按正文，选择「从这里听」", color = muted, fontSize = 10.sp, modifier = Modifier.weight(1f))
-                    TextButton(onClick = {
-                        resumableProgress = currentSentence?.let { sentence ->
-                            ReadingProgress(bookId, sentence.locatorJson, sentence.index, audio.positionMs)
-                        }
-                        PlaybackHub.stop(this@ReaderActivity)
-                    }) {
-                        Text("结束听书", color = muted, fontSize = 10.sp)
-                    }
-                }
-            } else {
-                Text(
-                    "从当前可见段落开始，长按正文可选择起点",
-                    color = muted,
-                    fontSize = 10.sp,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 8.dp),
-                )
             }
         }
     }
@@ -951,13 +883,18 @@ class ReaderActivity : FragmentActivity() {
 
     companion object {
         const val EXTRA_BOOK_ID = "book_id"
+        private const val EXTRA_OPEN_PLAYER = "open_player"
         private const val STATE_LOCATOR = "reader_locator"
         private const val STATE_FOLLOW = "reader_follow_audio"
         private const val STATE_PLAYBACK_INTENT = "reader_playback_intent"
         private const val STATE_READING_START = "reader_requested_start"
+        private const val STATE_READING_CONTROLS = "reader_controls_visible"
+        private const val STATE_LISTENING = "reader_listening_visible"
+        private const val STATE_STOPPED_PROGRESS = "reader_stopped_progress"
         private const val SELECTION_LISTEN_ID = 0x46524545
 
-        fun intent(context: Context, bookId: String): Intent = Intent(context, ReaderActivity::class.java)
+        fun intent(context: Context, bookId: String, openPlayer: Boolean = false): Intent = Intent(context, ReaderActivity::class.java)
             .putExtra(EXTRA_BOOK_ID, bookId)
+            .putExtra(EXTRA_OPEN_PLAYER, openPlayer)
     }
 }

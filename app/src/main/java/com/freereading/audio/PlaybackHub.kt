@@ -19,6 +19,8 @@ data class PlaybackSnapshot(
     val text: String = "",
     val positionMs: Long = 0,
     val durationMs: Long = 0,
+    val chapterProgress: Float = 0f,
+    val chapterSentenceCount: Int = 0,
     val isPlaying: Boolean = false,
     val isPreparing: Boolean = false,
     val speed: Float = 1f,

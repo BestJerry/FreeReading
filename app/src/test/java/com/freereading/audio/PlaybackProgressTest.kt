@@ -5,37 +5,39 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlaybackProgressTest {
-    @Test fun reopeningAudioWithZeroPositionAndDurationReturnsZeroRatherThanNaN() {
-        val reopening = PlaybackSnapshot(positionMs = 0, durationMs = 0, isPreparing = true)
-        assertEquals(0f, reopening.progressFraction, 0f)
-        assertTrue(reopening.progressFraction.isFinite())
+    @Test fun preparingWithoutAudioDurationHasFiniteZeroProgress() {
+        val preparing = PlaybackSnapshot(isPreparing = true)
+        assertEquals(0f, preparing.chapterProgressFraction, 0f)
+        assertTrue(preparing.chapterProgressFraction.isFinite())
     }
 
-    @Test fun positivePositionWithUnknownOrNegativeDurationStillReturnsZero() {
-        for (duration in listOf(0L, -1L, Long.MIN_VALUE)) {
-            assertEquals(0f, PlaybackSnapshot(positionMs = 5_000, durationMs = duration).progressFraction, 0f)
+    @Test fun invalidFractionsCannotReachProgressBarSemantics() {
+        for (fraction in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            assertEquals(0f, PlaybackSnapshot(chapterProgress = fraction).chapterProgressFraction, 0f)
         }
     }
 
-    @Test fun negativePositionsAreClampedToZero() {
-        for (position in listOf(-1L, Long.MIN_VALUE)) {
-            assertEquals(0f, PlaybackSnapshot(positionMs = position, durationMs = 10_000).progressFraction, 0f)
-        }
+    @Test fun negativeChapterProgressIsClampedToZero() {
+        assertEquals(0f, PlaybackSnapshot(chapterProgress = -0.1f).chapterProgressFraction, 0f)
     }
 
-    @Test fun aPositionBeyondTheDurationIsClampedToOne() {
-        assertEquals(1f, PlaybackSnapshot(positionMs = 15_000, durationMs = 10_000).progressFraction, 0f)
-        assertEquals(1f, PlaybackSnapshot(positionMs = Long.MAX_VALUE, durationMs = 1).progressFraction, 0f)
+    @Test fun overshootingChapterProgressIsClampedToOne() {
+        assertEquals(1f, PlaybackSnapshot(chapterProgress = 1.1f).chapterProgressFraction, 0f)
     }
 
-    @Test fun largeLongValuesRemainFiniteAndKeepTheExpectedFraction() {
-        val half = PlaybackSnapshot(positionMs = Long.MAX_VALUE / 2, durationMs = Long.MAX_VALUE).progressFraction
-        assertEquals(0.5f, half, 0.000001f)
-        assertTrue(half.isFinite())
-        assertEquals(1f, PlaybackSnapshot(positionMs = Long.MAX_VALUE, durationMs = Long.MAX_VALUE).progressFraction, 0f)
+    @Test fun validChapterFractionIsPreserved() {
+        assertEquals(0.25f, PlaybackSnapshot(chapterProgress = 0.25f).chapterProgressFraction, 0f)
     }
 
-    @Test fun aValidWithinSentencePositionReturnsItsActualFraction() {
-        assertEquals(0.25f, PlaybackSnapshot(positionMs = 2_500, durationMs = 10_000).progressFraction, 0f)
+    @Test fun sentenceBoundaryDoesNotReplaceChapterProgressWithSentenceProgress() {
+        val endOfFirst = PlaybackSnapshot(positionMs = 2_000, durationMs = 2_000, chapterProgress = 0.25f)
+        val startOfSecond = endOfFirst.copy(positionMs = 0, durationMs = 6_000)
+        assertEquals(0.25f, endOfFirst.chapterProgressFraction, 0f)
+        assertEquals(endOfFirst.chapterProgressFraction, startOfSecond.chapterProgressFraction, 0f)
+    }
+
+    @Test fun speedDoesNotChangeTextPositionProgress() {
+        val normal = PlaybackSnapshot(chapterProgress = 0.25f, speed = 1f)
+        assertEquals(normal.chapterProgressFraction, normal.copy(speed = 2f).chapterProgressFraction, 0f)
     }
 }
