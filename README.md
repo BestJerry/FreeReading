@@ -6,12 +6,12 @@ FreeReading 是使用 **Kotlin 和 Jetpack Compose** 开发的 Android 原生本
 
 ## 下载安装
 
-当前已发布的测试安装包为 v0.1.2；0.1.5 的独立阅读与听书界面可从源码构建体验。
+当前已发布的测试安装包为 **v0.1.5**，包含独立阅读与听书界面、快速起播和章节百分比进度。
 
-- [下载 v0.1.2 Android APK](https://github.com/BestJerry/FreeReading/releases/download/v0.1.2/FreeReading-v0.1.2.apk)
-- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading/releases/tag/v0.1.2)
+- [下载 v0.1.5 Android APK](https://github.com/BestJerry/FreeReading/releases/download/v0.1.5/FreeReading-v0.1.5.apk)
+- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading/releases/tag/v0.1.5)
 
-下载 APK 后，按 Android 系统提示允许该下载来源安装应用，即可安装。当前发布的是与真机验证一致的 **Debug 签名测试包**；同签名的已有测试版可覆盖安装，保留书架与进度。听书需在系统语音设置中安装对应语言的离线音色。
+下载 APK 后，按 Android 系统提示允许该下载来源安装应用，即可安装。当前发布的是 **Debug 签名测试包**；同签名的已有测试版可覆盖安装，保留书架与进度。听书需在系统语音设置中安装对应语言的离线音色。本轮通过本地单测、构建和静态检查，未进行真机复测。
 
 ## 功能
 
