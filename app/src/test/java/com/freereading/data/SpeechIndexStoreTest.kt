@@ -166,6 +166,98 @@ class SpeechIndexStoreTest {
         assertTrue(loaded.locatorJson.contains("😀"))
     }
 
+    @Test fun singleSentenceReadSupportsV1AndPreservesTheExactLocator() = runBlocking {
+        val entries = JSONArray()
+        repeat(3) { index ->
+            val text = "旧版第${index}句。"
+            entries.put(JSONObject().put("index", index).put("text", text)
+                .put("locatorJson", source(text).locator.toJSON().toString())
+                .put("chapterIndex", 2).put("chapterTitle", "旧章"))
+        }
+        val file = target().apply {
+            writeText(JSONObject().put("version", 1).put("bookId", id).put("sentences", entries).toString())
+        }
+
+        val sentence = store.readSentence(file, id, 3, 1)
+
+        assertEquals(1, sentence.index)
+        assertEquals("旧版第1句。", sentence.text)
+        assertEquals(entries.getJSONObject(1).getString("locatorJson"), sentence.locatorJson)
+        assertNull(sentence.source)
+        assertEquals(2, sentence.chapterIndex)
+    }
+
+    @Test fun singleSentenceReadSupportsV2RangesAndSourcesAfterTheSentences() = runBlocking {
+        val first = source("甲。".repeat(100))
+        val second = source("另一段。")
+        val sentences = List(100) { SpeechSentence(it, first, it * 2, it * 2 + 2) } +
+            SpeechSentence(100, second, 0, second.text.length)
+        val file = target()
+        store.write(file, book(sentences))
+        val json = JSONObject(file.readText())
+        file.writeText(JSONObject().put("sentences", json.getJSONArray("sentences"))
+            .put("sources", json.getJSONArray("sources")).put("version", 2).put("bookId", id).toString())
+
+        for (index in listOf(73, 100)) {
+            val sentence = store.readSentence(file, id, sentences.size, index)
+            assertEquals(index, sentence.index)
+            assertEquals(sentences[index].text, sentence.text)
+            assertEquals(sentences[index].locatorJson, sentence.locatorJson)
+        }
+    }
+
+    @Test fun singleSentenceReadRejectsMismatchedCountsAndInvalidEvidence() = runBlocking {
+        val file = target()
+        val emoji = source("甲😀乙。")
+        store.write(file, book(listOf(SpeechSentence(0, emoji, 0, emoji.text.length))))
+        val valid = file.readText()
+        expectIo { store.readSentence(file, id, 2, 0) }
+        expectIo { store.readSentence(file, "b".repeat(64), 1, 0) }
+        expectIo { store.readSentence(file, id, 1, 1) }
+        expectIo { SpeechIndexStore(file.length() - 1).readSentence(file, id, 1, 0) }
+        for ((field, value) in listOf("sourceIndex" to 1, "endOffset" to 99,
+            "startOffset" to 2, "endOffset" to 2)) {
+            val corrupt = JSONObject(valid)
+            corrupt.getJSONArray("sentences").getJSONObject(0).put(field, value)
+            file.writeText(corrupt.toString())
+            expectIo { store.readSentence(file, id, 1, 0) }
+        }
+        file.writeText(JSONObject(valid).put("version", 99).toString())
+        expectIo { store.readSentence(file, id, 1, 0) }
+        file.writeText(valid + "{}")
+        expectIo { store.readSentence(file, id, 1, 0) }
+        file.writeText(valid.dropLast(1) + ",\"bookId\":\"$id\"}")
+        expectIo { store.readSentence(file, id, 1, 0) }
+    }
+
+    @Test fun singleSentenceReadStreamsALargeSourceTableInsteadOfLoadingTheOldBook() = runBlocking {
+        val file = target()
+        val count = 10_000
+        val locator = source("溪水".repeat(2_000)).locator.toJSON().toString()
+        file.bufferedWriter().use { writer ->
+            writer.write("{\"version\":2,\"bookId\":\"$id\",\"sources\":[")
+            val entry = JSONObject().put("locatorJson", locator).put("chapterIndex", 0)
+                .put("chapterTitle", "原创大索引").toString()
+            repeat(count) { index ->
+                if (index > 0) writer.write(",")
+                writer.write(entry)
+            }
+            writer.write("],\"sentences\":[")
+            repeat(count) { index ->
+                if (index > 0) writer.write(",")
+                writer.write("{\"index\":$index,\"sourceIndex\":$index,\"startOffset\":0,\"endOffset\":2}")
+            }
+            writer.write("]}")
+        }
+
+        val sentence = store.readSentence(file, id, count, count - 2)
+
+        assertTrue(file.length() > 40_000_000L)
+        assertEquals(count - 2, sentence.index)
+        assertEquals("溪水", sentence.text)
+        assertEquals(4_000, sentence.source!!.text.length)
+    }
+
     private fun oneSentenceBook(): SpeechBook {
         val source = source("第一句。")
         return book(listOf(SpeechSentence(0, source, 0, source.text.length)))

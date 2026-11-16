@@ -1,5 +1,6 @@
 package com.freereading.reader
 
+import com.freereading.epub.withoutLeadingHtmlBom
 import java.util.IdentityHashMap
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -13,7 +14,7 @@ internal sealed interface SourceSpeechAnchor {
 
 /** Resolves only within the original XHTML resource supplied by the caller. */
 internal class SourceSentenceResolver(html: String) {
-    private val document = Jsoup.parse(html)
+    private val document = Jsoup.parse(html.withoutLeadingHtmlBom())
     private val elements = document.getAllElements().toList()
     private val documentOrder = IdentityHashMap<Element, Int>().apply {
         elements.forEachIndexed { index, element -> put(element, index) }

@@ -87,7 +87,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import org.json.JSONObject
-import org.readium.r2.navigator.Decoration
 import org.readium.r2.navigator.HyperlinkNavigator
 import org.readium.r2.navigator.epub.EpubNavigatorFactory
 import org.readium.r2.navigator.epub.EpubNavigatorFragment
@@ -142,6 +141,9 @@ class ReaderActivity : FragmentActivity() {
     private var requestedReadingStart: Locator? = null
     private var readingNavigationRevision = 0L
     private var readingStartJob: Job? = null
+    private var audioBinding: Job? = null
+    private var audioHighlighter: AudioHighlightSynchronizer? = null
+    private var audioPageReady = false
     private val sourceResolverMutex = Mutex()
     private var sourceResolver: Pair<String, SourceSentenceResolver>? = null
     private data class VisibleTextSnapshot(val page: Locator, val textAnchor: Locator, val revision: Long)
@@ -180,7 +182,6 @@ class ReaderActivity : FragmentActivity() {
         pageStyle = preferences.getString("page_style", "paper").orEmpty()
         scroll = preferences.getBoolean("scroll", false)
         buildViews()
-        observeAudio()
         openBook()
     }
 
@@ -241,6 +242,9 @@ class ReaderActivity : FragmentActivity() {
     }
 
     private fun installNavigator(opened: Publication, book: SpeechBook, saved: ReadingProgress) {
+        audioBinding?.cancel()
+        audioHighlighter = null
+        audioPageReady = false
         speechBook = book
         publication = opened
         readingOrderHrefs = opened.readingOrder.map { it.url().removeFragment().toString() }
@@ -255,6 +259,7 @@ class ReaderActivity : FragmentActivity() {
             else -> saved.locatorJson
         }?.let(::parseLocator)
         visibleLocator = initial
+        var installedFragment: EpubNavigatorFragment? = null
         val factory = EpubNavigatorFactory(opened).createFragmentFactory(
             initialLocator = initial,
             initialPreferences = epubPreferences(),
@@ -284,6 +289,16 @@ class ReaderActivity : FragmentActivity() {
                     toast("这一章节暂时无法显示，可尝试从目录跳转到其他章节。")
                 }
             },
+            paginationListener = object : EpubNavigatorFragment.PaginationListener {
+                override fun onPageLoaded() {
+                    val fragment = installedFragment ?: return
+                    if (navigator !== fragment || fragment.view == null) return
+                    audioPageReady = true
+                    // Readium can cache a decoration while dropping its script before isLoaded.
+                    // A new render generation forces a real DOM update once the page is ready.
+                    audioHighlighter?.onPageLoaded()
+                }
+            },
             configuration = EpubNavigatorFragment.Configuration(
                 selectionActionModeCallback = selectionMenu,
                 shouldApplyInsetsPadding = false,
@@ -291,7 +306,9 @@ class ReaderActivity : FragmentActivity() {
         )
         supportFragmentManager.fragmentFactory = factory
         val fragment = factory.instantiate(classLoader, EpubNavigatorFragment::class.java.name) as EpubNavigatorFragment
+        installedFragment = fragment
         navigator = fragment
+        observeAudio(fragment)
         fragment.addInputListener(object : InputListener {
             override fun onTap(event: TapEvent): Boolean {
                 val width = fragment.view?.width ?: return false
@@ -322,7 +339,6 @@ class ReaderActivity : FragmentActivity() {
         loading = false
         openingOverlay.visibility = View.GONE
         observeLocator(fragment)
-        synchronizeAudio()
     }
 
     @OptIn(FlowPreview::class)
@@ -337,37 +353,51 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
-    private fun observeAudio() {
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                PlaybackHub.state
-                    .map { it.bookId to it.sentenceIndex }
-                    .distinctUntilChanged()
-                    .collect { synchronizeAudio() }
+    private fun observeAudio(fragment: EpubNavigatorFragment) {
+        fragment.viewLifecycleOwnerLiveData.observe(this) { owner ->
+            if (navigator !== fragment) return@observe
+            audioBinding?.cancel()
+            audioHighlighter = null
+            if (owner == null) {
+                audioPageReady = false
+                return@observe
+            }
+            audioBinding = owner.lifecycleScope.launch {
+                owner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    val synchronizer = AudioHighlightSynchronizer(
+                        scope = this,
+                        apply = { fragment.applyDecorations(it, group = "speech") },
+                        navigate = { fragment.go(it, animated = false) },
+                        canNavigate = { target ->
+                            val audio = PlaybackHub.state.value
+                            navigator === fragment && fragment.view != null && followAudio &&
+                                owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
+                                audio.bookId == target.bookId && audio.sentenceIndex == target.sentenceIndex
+                        },
+                    )
+                    audioHighlighter = synchronizer
+                    if (audioPageReady) synchronizer.onPageLoaded()
+                    try {
+                        PlaybackHub.state
+                            .map { it.bookId to it.sentenceIndex }
+                            .distinctUntilChanged()
+                            .collect { synchronizeAudio() }
+                    } finally {
+                        if (audioHighlighter === synchronizer) audioHighlighter = null
+                    }
+                }
             }
         }
     }
 
     private fun synchronizeAudio() {
-        val fragment = navigator ?: return
-        if (fragment.view == null) return
+        val synchronizer = audioHighlighter ?: return
         val audio = PlaybackHub.state.value
         val sentence = speechBook?.sentences?.getOrNull(audio.sentenceIndex)
             ?.takeIf { audio.bookId == bookId }
-        lifecycleScope.launch {
-            val locator = sentence?.locatorJson?.let(::parseLocator)
-            fragment.applyDecorations(
-                locator?.let {
-                    listOf(Decoration(
-                        id = "speech-sentence",
-                        locator = it,
-                        style = Decoration.Style.Highlight(tint = 0xFFE4CB88.toInt()),
-                    ))
-                } ?: emptyList(),
-                group = "speech",
-            )
-            if (locator != null && followAudio) fragment.go(locator, animated = false)
-        }
+        val locator = sentence?.locatorJson?.let(::parseLocator)
+        val target = locator?.let { AudioHighlightSynchronizer.Target(bookId, audio.sentenceIndex, it) }
+        synchronizer.request(target, navigate = followAudio)
     }
 
     private suspend fun saveReadingLocation(fragment: EpubNavigatorFragment, page: Locator) {
@@ -670,6 +700,8 @@ class ReaderActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        audioBinding?.cancel()
+        audioHighlighter = null
         navigator?.takeIf { it.isAdded && !supportFragmentManager.isDestroyed }?.let { fragment ->
             // Restoration is handled by reopening the file, so discard the old Fragment's
             // ViewModels even on rotation before releasing its Publication.

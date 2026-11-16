@@ -6,7 +6,9 @@ import android.os.Environment
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import com.freereading.ReadingApplication
+import com.freereading.data.ImportStage
 import java.io.File
+import java.util.Collections
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
@@ -71,7 +73,7 @@ class ExternalImportViewModelTest {
     }
 
     @Test fun realExternalImportIsDeduplicatedAndOpenedOnlyOnce() = runTest(dispatcher) {
-        val states = mutableListOf<ExternalImportState>()
+        val states = Collections.synchronizedList(mutableListOf<ExternalImportState>())
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { model.state.toList(states) }
         assertEquals(ExternalImportState.Ready, model.state.value)
         val intent = view(sampleFile("shared-book.epub"))
@@ -98,7 +100,9 @@ class ExternalImportViewModelTest {
         runCurrent()
         assertEquals(ExternalImportState.Finished, model.state.value)
         assertEquals(1, states.filterIsInstance<ExternalImportState.Imported>().size)
-        assertEquals(1, states.count { it == ExternalImportState.Importing })
+        val progressStates = states.filterIsInstance<ExternalImportState.Importing>()
+        assertEquals(1, progressStates.map { it.requestId }.distinct().size)
+        assertTrue(progressStates.any { it.progress.stage != ImportStage.WAITING })
         assertEquals(1, states.count { it == ExternalImportState.Finished })
     }
 
@@ -108,12 +112,17 @@ class ExternalImportViewModelTest {
             writeText("broken EPUB")
         }
         model.accept(view(source))
+        val firstRequest = model.state.value as ExternalImportState.Importing
+        assertEquals(ImportStage.WAITING, firstRequest.progress.stage)
         val failed = awaitState { it is ExternalImportState.Failed } as ExternalImportState.Failed
         assertTrue(failed.canRetry)
         assertTrue(app.repository.books.value.isEmpty())
 
         copySampleTo(source)
         model.retry()
+        val retryRequest = model.state.value as ExternalImportState.Importing
+        assertTrue(retryRequest.requestId > firstRequest.requestId)
+        assertEquals(ImportStage.WAITING, retryRequest.progress.stage)
         val imported = awaitState { it is ExternalImportState.Imported } as ExternalImportState.Imported
         assertEquals(imported.bookId, app.repository.books.value.single().id)
     }
@@ -130,20 +139,33 @@ class ExternalImportViewModelTest {
     }
 
     @Test fun latestDifferentUriWinsOverAnEarlierImport() = runTest(dispatcher) {
+        val states = Collections.synchronizedList(mutableListOf<ExternalImportState>())
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { model.state.toList(states) }
         val first = view(sampleFile("first.epub"))
         val lastFile = File(sharedRoot, "Download/latest.epub").apply {
             parentFile!!.mkdirs()
             writeText("the latest request is not an EPUB")
         }
         model.accept(first)
+        val firstRequest = model.state.value as ExternalImportState.Importing
         runCurrent()
         model.accept(view(lastFile))
+        val latestRequest = model.state.value as ExternalImportState.Importing
+        assertTrue(latestRequest.requestId > firstRequest.requestId)
+        assertEquals(ImportStage.WAITING, latestRequest.progress.stage)
         val latestFailure = awaitState { it is ExternalImportState.Failed } as ExternalImportState.Failed
         assertTrue(latestFailure.canRetry)
         // The repository lock provides a completion barrier for any canceled first import.
         app.repository.refresh()
         runCurrent()
         assertEquals(latestFailure, model.state.value)
+        val observed = synchronized(states) { states.toList() }
+        val latestStart = observed.indexOfFirst {
+            it is ExternalImportState.Importing && it.requestId == latestRequest.requestId
+        }
+        assertTrue(latestStart >= 0)
+        assertTrue(observed.drop(latestStart).filterIsInstance<ExternalImportState.Importing>()
+            .all { it.requestId == latestRequest.requestId })
     }
 
     private suspend fun awaitState(predicate: (ExternalImportState) -> Boolean): ExternalImportState =

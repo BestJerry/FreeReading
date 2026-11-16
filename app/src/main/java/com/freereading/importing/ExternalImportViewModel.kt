@@ -7,16 +7,21 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.freereading.R
 import com.freereading.ReadingApplication
+import com.freereading.data.BookImportProgress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 sealed interface ExternalImportState {
     data object Ready : ExternalImportState
-    data object Importing : ExternalImportState
+    data class Importing(
+        val progress: BookImportProgress = BookImportProgress(),
+        internal val requestId: Long = 0,
+    ) : ExternalImportState
     data class Imported(val bookId: String) : ExternalImportState
     data class Failed(val message: String, val canRetry: Boolean) : ExternalImportState
     data object Finished : ExternalImportState
@@ -55,12 +60,18 @@ class ExternalImportViewModel(application: Application) : AndroidViewModel(appli
             mutableState.value = ExternalImportState.Failed(app.getString(R.string.external_import_invalid), false)
             return
         }
-        mutableState.value = ExternalImportState.Importing
+        mutableState.value = ExternalImportState.Importing(requestId = token)
         importing = viewModelScope.launch {
             try {
                 // This Activity can be the process's first screen, without opening the shelf.
                 app.repository.refresh()
-                val book = app.repository.importBook(uri)
+                val book = app.repository.importBook(uri) { progress ->
+                    mutableState.update { current ->
+                        if (current is ExternalImportState.Importing && current.requestId == token) {
+                            current.copy(progress = progress)
+                        } else current
+                    }
+                }
                 ensureActive()
                 if (request == token) mutableState.value = ExternalImportState.Imported(book.id)
             } catch (cancelled: CancellationException) {

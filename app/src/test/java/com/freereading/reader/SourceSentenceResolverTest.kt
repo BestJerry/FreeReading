@@ -12,6 +12,18 @@ class SourceSentenceResolverTest {
     private fun sourceSelector(html: String, selector: String): String =
         requireNotNull(Jsoup.parse(html).selectFirst(selector)).cssSelector()
 
+    @Test fun leadingBomCannotShiftBrowserParagraphSelectorsToHeadNodes() {
+        val html = """<?xml version="1.0" encoding="UTF-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml"><head><meta name="generator" content="original"/>
+            <title>不能当作正文的标题</title><link rel="stylesheet" href="style.css"/></head>
+            <body><h1>正文标题</h1><p class="a">第一段。</p><p class="a">第二段。</p></body></html>""".trimIndent()
+        val candidates = listOf(candidate(4, "html > body > p.a:nth-child(2)", "第一段。"),
+            candidate(7, "html > body > p.a:nth-child(3)", "第二段。"))
+
+        assertEquals(7, SourceSentenceResolver("\uFEFF$html").resolve(candidates,
+            SourceSpeechAnchor.Element("p.a:nth-of-type(2)")))
+    }
+
     @Test fun sourceIdentityResolvesHeadingWhereTextAndSelectorStringsBothDiffer() {
         val html = "<h1 class='part'><span>第1</span>\n<span>部分</span></h1><p>正文。</p>"
         val candidates = listOf(candidate(12, sourceSelector(html, "h1"), "第1部分"))

@@ -8,11 +8,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import org.readium.r2.shared.ExperimentalReadiumApi
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.encryption.encryption
 import org.readium.r2.shared.publication.epub.EpubLayout
 import org.readium.r2.shared.publication.epub.layout
 import org.readium.r2.shared.publication.presentation.presentation
+import org.readium.r2.shared.publication.services.content.DefaultContentService
+import org.readium.r2.shared.publication.services.content.contentServiceFactory
 import org.readium.r2.shared.publication.services.isProtected
 import org.readium.r2.shared.publication.services.isRestricted
 import org.readium.r2.shared.util.AbsoluteUrl
@@ -31,11 +34,11 @@ class ReadiumEngine(context: Context) {
     private val retriever = AssetRetriever(context.applicationContext.contentResolver, DefaultHttpClient())
     private val opener = PublicationOpener(EpubParser())
 
-    suspend fun open(file: File): Publication {
+    suspend fun open(file: File, onProgress: ((Long, Long?) -> Unit)? = null): Publication {
         var pending: Publication? = null
         try {
             return withContext(Dispatchers.IO) {
-                openLocal(file).also { pending = it }
+                openLocal(file, onProgress).also { pending = it }
             }
         } catch (error: Throwable) {
             // Cancellation during the dispatcher handoff can discard a successfully opened value.
@@ -44,7 +47,9 @@ class ReadiumEngine(context: Context) {
         }
     }
 
-    private suspend fun openLocal(file: File): Publication {
+    @OptIn(ExperimentalReadiumApi::class)
+    private suspend fun openLocal(file: File, onProgress: ((Long, Long?) -> Unit)?): Publication {
+        onProgress?.invoke(0, null)
         validateArchive(file)
         currentCoroutineContext().ensureActive()
         val asset = retriever.retrieve(file).getOrElse {
@@ -54,7 +59,11 @@ class ReadiumEngine(context: Context) {
             if (!asset.format.conformsTo(Specification.Epub)) {
                 throw BookImportException("目前仅支持 EPUB 格式")
             }
-            opener.open(asset, allowUserInteraction = false).getOrElse {
+            // Readium 3.1.2 ignores its constructor hook; the per-open hook is applied to this builder.
+            opener.open(asset, allowUserInteraction = false, onCreatePublication = {
+                servicesBuilder.contentServiceFactory = DefaultContentService.createFactory(
+                    listOf(BomAwareHtmlContentIteratorFactory()))
+            }).getOrElse {
                 throw BookImportException("EPUB 内容损坏或缺少必要文件，无法打开")
             }
         } catch (error: Throwable) {
@@ -62,7 +71,7 @@ class ReadiumEngine(context: Context) {
             throw error
         }
         try {
-            validatePublication(publication)
+            validatePublication(publication, onProgress)
             currentCoroutineContext().ensureActive()
             // Publication retains the asset's container until Publication.close().
             return publication
@@ -72,7 +81,7 @@ class ReadiumEngine(context: Context) {
         }
     }
 
-    private suspend fun validatePublication(publication: Publication) {
+    private suspend fun validatePublication(publication: Publication, onProgress: ((Long, Long?) -> Unit)?) {
         if (publication.isProtected || publication.isRestricted) {
             throw BookImportException("暂不支持有 DRM 保护的 EPUB，请导入无 DRM 的书籍")
         }
@@ -100,7 +109,9 @@ class ReadiumEngine(context: Context) {
         }
         // Readium's content iterator logs unreadable chapters and skips them. Check them here so
         // a damaged archive cannot silently import an incomplete speech index.
-        for (link in publication.readingOrder) {
+        val total = publication.readingOrder.size.toLong()
+        onProgress?.invoke(0, total)
+        for ((index, link) in publication.readingOrder.withIndex()) {
             currentCoroutineContext().ensureActive()
             val resource = publication.get(link)
                 ?: throw BookImportException("EPUB 缺少部分正文文件，无法完整导入")
@@ -109,6 +120,7 @@ class ReadiumEngine(context: Context) {
                     throw BookImportException("EPUB 的部分章节无法读取，请更换完整文件")
                 }
             }
+            onProgress?.invoke(index + 1L, total)
         }
     }
 

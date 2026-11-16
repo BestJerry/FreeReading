@@ -20,7 +20,8 @@ import org.readium.r2.shared.publication.Locator
 internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLimits.MAX_INDEX_BYTES) {
     init { require(maxIndexBytes in 1..SpeechIndexLimits.MAX_INDEX_BYTES) }
 
-    suspend fun write(file: File, book: SpeechBook) {
+    suspend fun write(file: File, book: SpeechBook, onProgress: ((Long, Long?) -> Unit)? = null) {
+        onProgress?.invoke(0, null)
         checkCount(book.sentences.size)
         if (book.book.sentenceCount != book.sentences.size) throw IOException("Unexpected sentence count")
         val sources = ArrayList<SpeechSource>()
@@ -39,6 +40,9 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
                 sourceIds[source] = it
             }
         }
+        val total = sources.size.toLong() + book.sentences.size
+        onProgress?.invoke(0, total)
+        var completed = 0L
         val atomic = AtomicFile(file)
         val output = atomic.startWrite()
         try {
@@ -57,6 +61,8 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
                 writer.beginObject().name("locatorJson").value(json)
                 writer.name("chapterIndex").value(source.chapterIndex)
                 writer.name("chapterTitle").value(source.chapterTitle).endObject()
+                completed += 1
+                onProgress?.invoke(completed, total)
             }
             writer.endArray().name("sentences").beginArray()
             for ((index, sentence) in book.sentences.withIndex()) {
@@ -65,14 +71,18 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
                 writer.name("sourceIndex").value(sentenceSources[index])
                 writer.name("startOffset").value(sentence.startOffset)
                 writer.name("endOffset").value(sentence.endOffset).endObject()
+                completed += 1
+                // The last record can still be buffered or fail the byte limit during flush.
+                if (completed < total) onProgress?.invoke(completed, total)
             }
             writer.endArray().endObject()
             writer.flush()
-            atomic.finishWrite(output)
+            atomic.finishWriteChecked(output)
         } catch (error: Throwable) {
             atomic.failWrite(output)
             throw error
         }
+        onProgress?.invoke(total, total)
     }
 
     suspend fun read(file: File, bookId: String, expectedCount: Int): List<SpeechSentence> {
@@ -177,6 +187,130 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         }
         if (used.any { !it }) throw IOException("Unused source locator")
         return sentences
+    }
+
+    /** Read migration evidence without keeping the old index beside the rebuilt book in memory. */
+    suspend fun readSentence(file: File, bookId: String, expectedCount: Int, index: Int): SpeechSentence {
+        checkCount(expectedCount)
+        if (index !in 0 until expectedCount) throw IOException("Invalid sentence index")
+        val first = scanSentence(file, bookId, expectedCount, index)
+        val fields = first.sentence
+        if (first.version == 1) {
+            val json = requireNotNull(fields.locatorJson)
+            parseLocator(json)
+            return SpeechSentence(index, requireNotNull(fields.text), json,
+                requireNotNull(fields.chapter), fields.title.orEmpty())
+        }
+        // Sources normally precede ranges in v2. Scan again after finding the source ID,
+        // retaining only that source even for a book with hundreds of thousands of sources.
+        val second = scanSentence(file, bookId, expectedCount, index, requireNotNull(fields.sourceIndex))
+        if (first.version != second.version || first.sourceCount != second.sourceCount ||
+            fields != second.sentence) throw IOException("Speech index changed while reading")
+        val sourceFields = second.source ?: throw IOException("Missing source locator")
+        if (sourceFields.locatorJson.length > MAX_LOCATOR_CHARACTERS) throw IOException("Source locator is too large")
+        val locator = parseLocator(sourceFields.locatorJson)
+        if (locator.text.highlight == null) throw IOException("Missing source text")
+        val source = SpeechSource(locator, sourceFields.chapter, sourceFields.title)
+        validateSource(source)
+        val start = requireNotNull(fields.start)
+        val end = requireNotNull(fields.end)
+        validateRange(source, start, end)
+        return SpeechSentence(index, source, start, end)
+    }
+
+    private data class SentenceScan(
+        val version: Int,
+        val sourceCount: Int,
+        val sentence: SentenceFields,
+        val source: SourceFields?,
+    )
+
+    private suspend fun scanSentence(file: File, bookId: String, expectedCount: Int, index: Int,
+                                     sourceToRead: Int? = null): SentenceScan {
+        var version = -1
+        var actualBookId: String? = null
+        var count = 0
+        var sourceCount = 0
+        var rangeFormat: Boolean? = null
+        var selected: SentenceFields? = null
+        var source: SourceFields? = null
+        var largestSource = -1
+        var textCharacters = 0L
+        var locatorCharacters = 0L
+        val rootFields = HashSet<String>()
+        AtomicFile(file).openRead().use { input ->
+            if (input.channel.size() > maxIndexBytes) throw IOException("Speech index is too large")
+            JsonReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    val name = reader.nextName()
+                    if (!rootFields.add(name)) throw IOException("Duplicate index field")
+                    when (name) {
+                        "version" -> version = reader.nextInt()
+                        "bookId" -> actualBookId = reader.nextString()
+                        "sources" -> {
+                            reader.beginArray()
+                            while (reader.hasNext()) {
+                                currentCoroutineContext().ensureActive()
+                                if (sourceCount >= expectedCount) throw IOException("Too many sources")
+                                if (sourceCount == sourceToRead) source = readSource(reader) else reader.skipValue()
+                                sourceCount += 1
+                            }
+                            reader.endArray()
+                        }
+                        "sentences" -> {
+                            reader.beginArray()
+                            while (reader.hasNext()) {
+                                currentCoroutineContext().ensureActive()
+                                if (count >= expectedCount) throw IOException("Unexpected sentence count")
+                                val fields = readSentence(reader)
+                                if (fields.index != count) throw IOException("Invalid sentence order")
+                                val isRange = fields.sourceIndex != null
+                                if (rangeFormat != null && rangeFormat != isRange) throw IOException("Mixed index formats")
+                                rangeFormat = isRange
+                                if (isRange) {
+                                    if (fields.text != null || fields.locatorJson != null || fields.chapter != null ||
+                                        fields.title != null) throw IOException("Mixed sentence fields")
+                                    val start = fields.start ?: throw IOException("Missing range start")
+                                    val end = fields.end ?: throw IOException("Missing range end")
+                                    val sourceIndex = requireNotNull(fields.sourceIndex)
+                                    if (sourceIndex < 0 || start < 0 || end <= start || end.toLong() - start > 500) {
+                                        throw IOException("Invalid sentence range")
+                                    }
+                                    largestSource = maxOf(largestSource, sourceIndex)
+                                    textCharacters += end - start
+                                } else {
+                                    if (fields.start != null || fields.end != null) throw IOException("Unexpected range")
+                                    val text = fields.text ?: throw IOException("Missing sentence text")
+                                    val json = fields.locatorJson ?: throw IOException("Missing sentence locator")
+                                    val chapter = fields.chapter ?: throw IOException("Missing chapter")
+                                    if (text.isBlank() || text.length > 500 || json.length > MAX_LOCATOR_CHARACTERS ||
+                                        chapter < 0 || fields.title.orEmpty().length > 2048) throw IOException("Invalid legacy sentence")
+                                    textCharacters += text.length
+                                    locatorCharacters += json.length
+                                    checkLocatorBudget(locatorCharacters)
+                                }
+                                checkTextBudget(textCharacters)
+                                if (count == index) selected = fields
+                                count += 1
+                            }
+                            reader.endArray()
+                        }
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+                if (reader.peek() != JsonToken.END_DOCUMENT) throw IOException("Trailing index content")
+            }
+        }
+        if (actualBookId != bookId || count != expectedCount || "sentences" !in rootFields) {
+            throw IOException("Index does not match book metadata")
+        }
+        if (!(version == 1 && rangeFormat == false && "sources" !in rootFields) &&
+            !(version == VERSION && rangeFormat == true && sourceCount > 0 && largestSource < sourceCount)) {
+            throw IOException("Unsupported speech index")
+        }
+        return SentenceScan(version, sourceCount, selected ?: throw IOException("Missing sentence"), source)
     }
 
     private data class SourceFields(val locatorJson: String, val chapter: Int, val title: String)

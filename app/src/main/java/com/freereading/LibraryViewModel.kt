@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.freereading.audio.PlaybackHub
+import com.freereading.data.BookImportProgress
 import com.freereading.data.BookRecord
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -21,6 +22,8 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     val books = repository.books
     private val _busy = MutableStateFlow(false)
     val busy = _busy.asStateFlow()
+    private val _importProgress = MutableStateFlow<BookImportProgress?>(null)
+    val importProgress = _importProgress.asStateFlow()
     private val _error = MutableStateFlow<String?>(null)
     val error = _error.asStateFlow()
     private val _messages = MutableSharedFlow<String>()
@@ -41,17 +44,23 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     fun importBook(uri: Uri) {
         if (_busy.value) return
         _busy.value = true
+        _error.value = null
+        _importProgress.value = BookImportProgress()
         viewModelScope.launch {
-            try {
-                val book = repository.importBook(uri)
-                _messages.emit(app.getString(R.string.import_success, book.title))
+            val message = try {
+                val book = repository.importBook(uri) { _importProgress.value = it }
+                app.getString(R.string.import_success, book.title)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 _error.value = error.message ?: app.getString(R.string.import_failed)
+                null
             } finally {
+                _importProgress.value = null
                 _busy.value = false
             }
+            // A previous snackbar may still be visible; it must not keep a completed import busy.
+            if (message != null) _messages.emit(message)
         }
     }
 

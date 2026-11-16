@@ -15,7 +15,9 @@ import org.readium.r2.shared.publication.services.content.content
 
 /** The persisted order is independent of page layout, Android ICU version and playback speed. */
 class SentenceIndexer {
-    suspend fun index(publication: Publication): List<SpeechSentence> {
+    suspend fun index(publication: Publication, onProgress: ((Long, Long) -> Unit)? = null): List<SpeechSentence> {
+        val total = publication.readingOrder.size.toLong()
+        onProgress?.invoke(0, total)
         val content = publication.content()
             ?: throw BookImportException("无法提取这本 EPUB 的正文")
         val chapterByHref = publication.readingOrder.mapIndexed { index, link ->
@@ -28,9 +30,21 @@ class SentenceIndexer {
         var sourceLocatorCharacters = 0L
         var textCharacters = 0L
         val iterator = content.iterator()
+        var completedResources = 0L
         while (iterator.hasNext()) {
             currentCoroutineContext().ensureActive()
-            val element = iterator.next() as? Content.TextElement ?: continue
+            val nextElement = iterator.next()
+            if (onProgress != null) {
+                val resourceKey = nextElement.locator.href.removeFragment().removeQuery().toString()
+                val resourceIndex = chapterByHref[resourceKey]?.toLong()
+                // Entering the next resource confirms the preceding resources are exhausted,
+                // including empty chapters skipped by Readium and chapters containing only images.
+                if (resourceIndex != null && resourceIndex > completedResources) {
+                    completedResources = resourceIndex
+                    onProgress(completedResources, total)
+                }
+            }
+            val element = nextElement as? Content.TextElement ?: continue
             if (element.segments.sumOf { (it.locator.text.highlight ?: it.text).length.toLong() } >
                 SpeechIndexLimits.MAX_BLOCK_CHARACTERS
             ) {
@@ -76,6 +90,7 @@ class SentenceIndexer {
         if (sentences.isEmpty()) {
             throw BookImportException("这本 EPUB 没有可朗读的文字，暂不支持扫描图片书籍")
         }
+        onProgress?.invoke(total, total)
         return sentences
     }
 

@@ -82,6 +82,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.freereading.audio.PlaybackHub
 import com.freereading.audio.PlaybackSnapshot
 import com.freereading.data.BookRecord
+import com.freereading.importing.ImportProgressIndicator
 import com.freereading.reader.ReaderActivity
 import com.freereading.ui.Forest
 import com.freereading.ui.FreeReadingTheme
@@ -111,6 +112,8 @@ class MainActivity : ComponentActivity() {
 private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, openListening: (String) -> Unit) {
     val books by model.books.collectAsStateWithLifecycle()
     val busy by model.busy.collectAsStateWithLifecycle()
+    val importProgress by model.importProgress.collectAsStateWithLifecycle()
+    val isImporting = importProgress != null
     val error by model.error.collectAsStateWithLifecycle()
     val playback by PlaybackHub.state.collectAsStateWithLifecycle()
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -174,16 +177,19 @@ private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, o
                     }
                     if (books.isNotEmpty()) {
                         Button(onClick = importAction, enabled = !busy, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
-                            if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                            else Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text(stringResource(if (busy) R.string.importing_book else R.string.import_book), fontSize = 12.sp)
+                            Text(stringResource(if (isImporting) R.string.importing_book else R.string.import_book), fontSize = 12.sp)
                         }
                     }
                 }
+                importProgress?.let { progress ->
+                    Spacer(Modifier.height(16.dp))
+                    ImportProgressIndicator(progress)
+                }
             }
             if (books.isEmpty()) {
-                item { EmptyLibrary(busy, importAction) }
+                item { EmptyLibrary(busy, isImporting, importAction) }
             } else {
                 items(books, key = { it.id }) { book ->
                     BookRow(book, onOpen = { openBook(book.id) }, onDelete = { deleting = book })
@@ -226,7 +232,7 @@ private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, o
 }
 
 @Composable
-private fun EmptyLibrary(busy: Boolean, onImport: () -> Unit) {
+private fun EmptyLibrary(busy: Boolean, isImporting: Boolean, onImport: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(vertical = 22.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -267,10 +273,9 @@ private fun EmptyLibrary(busy: Boolean, onImport: () -> Unit) {
             shape = RoundedCornerShape(14.dp),
             contentPadding = PaddingValues(horizontal = 28.dp),
         ) {
-            if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-            else Icon(Icons.Default.Add, null, modifier = Modifier.size(20.dp))
+            Icon(Icons.Default.Add, null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(8.dp))
-            Text(stringResource(if (busy) R.string.importing_book else R.string.import_book))
+            Text(stringResource(if (isImporting) R.string.importing_book else R.string.import_book))
         }
     }
 }

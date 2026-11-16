@@ -34,4 +34,19 @@
     <string name="external_import_invalid">无法读取要导入的书籍，请从文件管理器重新打开或分享 EPUB 文件。</string>
     <string name="external_import_back">返回</string>
     <string name="retry">重试</string>
+    <string name="import_progress_description">书籍导入进度</string>
+    <string name="import_progress_waiting">准备导入</string>
+    <string name="import_progress_copying">复制文件</string>
+    <string name="import_progress_validating">检查书籍</string>
+    <string name="import_progress_indexing">整理正文</string>
+    <string name="import_progress_saving">保存书籍</string>
+    <string name="import_progress_completed">导入完成</string>
+    <string name="import_progress_step">第 %1$d/4 步</string>
+    <string name="import_progress_step_percent">本阶段 %1$d%%</string>
+    <string name="import_progress_percent">%1$d%%</string>
+    <string name="import_progress_step_detail">%1$s · %2$s</string>
+    <string name="import_progress_copy_known">已复制 %1$.1f / %2$.1f MB</string>
+    <string name="import_progress_copy_unknown">已复制 %1$.1f MB</string>
+    <string name="import_progress_index_known">已整理 %1$d / %2$d 节</string>
+    <string name="import_progress_index_unknown">已整理 %1$d 节</string>
 </resources>
