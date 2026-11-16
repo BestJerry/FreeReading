@@ -6,6 +6,7 @@ import com.freereading.audio.PlaybackSnapshot
 internal enum class ReadingPlaybackIntent {
     CONTINUE_AUDIO,
     FROM_READING_LOCATION,
+    RETRY_AUDIO_START,
 }
 
 internal enum class PrimaryPlaybackAction {
@@ -24,6 +25,7 @@ internal fun primaryPlaybackAction(
     val sameBook = snapshot.bookId == bookId
     return when {
         sameBook && (snapshot.isPlaying || snapshot.isPreparing) -> PrimaryPlaybackAction.PAUSE_OR_TOGGLE
+        intent == ReadingPlaybackIntent.RETRY_AUDIO_START -> PrimaryPlaybackAction.RESUME_SAVED_OR_READING
         intent == ReadingPlaybackIntent.FROM_READING_LOCATION -> PrimaryPlaybackAction.START_FROM_READING_LOCATION
         sameBook -> PrimaryPlaybackAction.RESUME_AUDIO
         else -> PrimaryPlaybackAction.RESUME_SAVED_OR_READING

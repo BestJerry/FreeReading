@@ -9,6 +9,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
+
+data class PlaybackStartFailure(
+    val requestId: String,
+    val bookId: String,
+    val sentenceIndex: Int,
+    val positionMs: Long,
+)
 
 data class PlaybackSnapshot(
     val bookId: String? = null,
@@ -26,6 +34,9 @@ data class PlaybackSnapshot(
     val speed: Float = 1f,
     val error: String? = null,
     val needsVoiceData: Boolean = false,
+    // Changes only when the service accepts a new book/start request, not on each sentence.
+    val playbackSessionId: String? = null,
+    val startFailure: PlaybackStartFailure? = null,
 )
 
 /** One process-wide stream; activities never own the player or TTS lifecycle. */
@@ -35,21 +46,50 @@ object PlaybackHub {
     // startService commands use an unpersisted capability so other apps cannot forge them.
     private val commandToken = UUID.randomUUID().toString()
     private const val EXTRA_COMMAND_TOKEN = "com.freereading.audio.PRIVATE_COMMAND_TOKEN"
+    // Request IDs expose ordering, so keep their namespace independent of the command capability.
+    private val playbackSessionNamespace = UUID.randomUUID().toString()
+    private val playbackSessionSequence = AtomicLong()
     private val mutableState = MutableStateFlow(PlaybackSnapshot())
     val state: StateFlow<PlaybackSnapshot> = mutableState.asStateFlow()
     @Volatile internal var serviceAlive = false
 
     /** Pass index = -1 to restore the persisted sentence and within-sentence position. */
-    fun playBook(context: Context, bookId: String, index: Int, offsetMs: Long = 0) {
+    fun playBook(context: Context, bookId: String, index: Int, offsetMs: Long = 0,
+                 playbackSessionId: String = newPlaybackSessionId()): Boolean {
         val intent = command(context, ReadingAudioService.ACTION_PLAY_BOOK)
             .putExtra(ReadingAudioService.EXTRA_BOOK_ID, bookId)
             .putExtra(ReadingAudioService.EXTRA_INDEX, index)
             .putExtra(ReadingAudioService.EXTRA_POSITION, offsetMs.coerceAtLeast(0))
-        try {
+            .putExtra(ReadingAudioService.EXTRA_PLAYBACK_SESSION_ID, playbackSessionId)
+        return try {
             ContextCompat.startForegroundService(context, intent)
+            true
         } catch (_: RuntimeException) {
             publish(state.value.copy(isPreparing = false, isPlaying = false,
-                error = context.getString(R.string.audio_start_failed)))
+                error = context.getString(R.string.audio_start_failed),
+                startFailure = PlaybackStartFailure(playbackSessionId, bookId, index, offsetMs.coerceAtLeast(0))))
+            false
+        }
+    }
+
+    internal fun newPlaybackSessionId(): String =
+        "$playbackSessionNamespace:${playbackSessionSequence.incrementAndGet()}"
+
+    internal fun isCurrentPlaybackSessionId(id: String?): Boolean = playbackSessionSequenceOf(id) != null
+
+    internal fun isPlaybackStartConfirmed(requestId: String?, currentSessionId: String?): Boolean {
+        val requested = playbackSessionSequenceOf(requestId) ?: return false
+        val current = playbackSessionSequenceOf(currentSessionId) ?: return false
+        return current >= requested
+    }
+
+    private fun playbackSessionSequenceOf(id: String?): Long? {
+        val prefix = "$playbackSessionNamespace:"
+        if (id == null || !id.startsWith(prefix)) return null
+        val suffix = id.removePrefix(prefix)
+        val sequence = suffix.toLongOrNull() ?: return null
+        return sequence.takeIf {
+            it > 0 && it <= playbackSessionSequence.get() && it.toString() == suffix
         }
     }
 

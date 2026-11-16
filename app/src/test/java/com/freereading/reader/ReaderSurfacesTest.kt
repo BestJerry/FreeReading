@@ -1,14 +1,18 @@
 package com.freereading.reader
 
 import android.app.Application
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import com.freereading.audio.PlaybackSnapshot
 import com.freereading.ui.Forest
 import com.freereading.ui.FreeReadingTheme
@@ -41,6 +45,44 @@ class ReaderSurfacesTest {
         compose.onNodeWithTag("reader_listen_shortcut").performClick()
 
         compose.runOnIdle { assertEquals(listOf("listen"), events) }
+    }
+
+    @Test fun activeReadingShowsAutomaticPageTurningAndCanPauseFollowing() {
+        val events = showChrome(hasAudio = true)
+
+        compose.onNodeWithTag("reader_audio_follow").assertIsDisplayed().assertIsEnabled()
+            .assertTextEquals("自动翻页")
+            .assertContentDescriptionEquals("暂停自动翻页")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "播放时自动翻页"))
+            .performClick()
+        compose.onNodeWithTag("reader_audio_follow").assertTextEquals("继续跟随")
+            .assertContentDescriptionEquals("跟随朗读自动翻页")
+        compose.onNodeWithTag("reader_listen_shortcut").assertIsDisplayed()
+        assertNoFullPlayerControls()
+
+        compose.runOnIdle { assertEquals(listOf("follow"), events) }
+    }
+
+    @Test fun detachedReadingCanResumeFollowingWithoutOpeningThePlayer() {
+        val events = showChrome(hasAudio = true, followingAudio = false, isPlaying = false)
+
+        compose.onNodeWithTag("reader_audio_follow").assertTextEquals("继续跟随")
+            .assertContentDescriptionEquals("跟随朗读自动翻页")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "已暂停跟随，已暂停"))
+            .performClick()
+        compose.onNodeWithTag("reader_audio_follow").assertTextEquals("自动翻页")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "已开启，听书已暂停"))
+        compose.onNodeWithTag("listening-screen").assertDoesNotExist()
+
+        compose.runOnIdle { assertEquals(listOf("follow"), events) }
+    }
+
+    @Test fun readingWithoutActiveAudioDoesNotOfferAutomaticPageTurning() {
+        showChrome()
+
+        compose.onNodeWithTag("reader_audio_follow").assertDoesNotExist()
+        compose.onNodeWithText("自动翻页").assertDoesNotExist()
+        compose.onNodeWithText("继续跟随").assertDoesNotExist()
     }
 
     @Test fun readingMenuExpandsAndRoutesToListeningWithoutEmbeddingPlaybackControls() {
@@ -77,6 +119,7 @@ class ReaderSurfacesTest {
 
         compose.onNodeWithTag("reader_controls_toggle").assertIsNotEnabled()
         compose.onNodeWithTag("reader_chrome_menu").assertDoesNotExist()
+        compose.onNodeWithTag("reader_audio_follow").assertIsNotEnabled()
         compose.onNodeWithTag("reader_listen_shortcut").assertIsEnabled().performClick()
 
         compose.runOnIdle { assertEquals(listOf("listen"), events) }
@@ -88,6 +131,7 @@ class ReaderSurfacesTest {
         listOf("reader_controls_toggle", "reader_contents", "reader_appearance")
             .forEach { compose.onNodeWithTag(it).assertIsNotEnabled() }
         compose.onNodeWithTag("reader_listen_shortcut").assertDoesNotExist()
+        compose.onNodeWithTag("reader_audio_follow").assertIsDisplayed().assertIsNotEnabled()
         compose.onNodeWithTag("reader_listen").assertIsEnabled().performClick()
 
         compose.runOnIdle { assertEquals(listOf("listen"), events) }
@@ -126,6 +170,45 @@ class ReaderSurfacesTest {
             click(Offset(shortcut.center.x - root.left, shortcut.center.y - root.top))
         }
         compose.runOnIdle { assertEquals(listOf("listen"), events) }
+    }
+
+    @Test fun automaticPageTurningControlStaysInsideTheTwentyEightDpFooter() {
+        val events = showChrome(hasAudio = true)
+        val root = compose.onNodeWithTag("reader_chrome").fetchSemanticsNode().boundsInRoot
+        val follow = compose.onNodeWithTag("reader_audio_follow").fetchSemanticsNode().boundsInRoot
+        val footer = compose.onNodeWithTag("reader_chrome_footer").fetchSemanticsNode().boundsInRoot
+        val outsideDistance = 5f * compose.density.density
+        compose.onNodeWithTag("reader_chrome_footer").assertHeightIsEqualTo(28.dp)
+        assertEquals(footer.top, follow.top, 0.5f)
+        assertEquals(footer.bottom, follow.bottom, 0.5f)
+
+        compose.onNodeWithTag("reader_chrome").performTouchInput {
+            click(Offset(follow.center.x - root.left, follow.top - root.top - outsideDistance))
+        }
+        compose.runOnIdle { assertEquals(emptyList<String>(), events) }
+        compose.onNodeWithTag("reader_chrome").performTouchInput {
+            click(Offset(follow.center.x - root.left, follow.center.y - root.top))
+        }
+        compose.runOnIdle { assertEquals(listOf("follow"), events) }
+    }
+
+    @Test
+    @Config(qualifiers = "w360dp-h800dp")
+    fun narrowReadingWithLargeTextKeepsBothFooterAudioActionsVisible() {
+        val events = showChrome(hasAudio = true, isPlaying = false, isPreparing = true, fontScale = 1.8f)
+
+        compose.onNodeWithTag("reader_chrome_footer").assertHeightIsEqualTo(28.dp)
+        compose.onNodeWithTag("reader_audio_follow").assertIsDisplayed().assertTextEquals("自动翻页")
+            .assertHeightIsEqualTo(28.dp)
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "已开启，正在准备语音"))
+        compose.onNodeWithTag("reader_listen_shortcut").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("reader_controls_toggle").performClick()
+        compose.onNodeWithTag("reader_audio_follow").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("reader_chrome_toolbar").assertIsDisplayed()
+        listOf("reader_contents", "reader_listen", "reader_appearance")
+            .forEach { compose.onNodeWithTag(it).assertIsDisplayed() }
+
+        compose.runOnIdle { assertEquals(listOf("toggle-tools", "follow"), events) }
     }
 
     @Test fun closingListeningReturnsToReadingWithoutStoppingThePlayingBook() {
@@ -256,17 +339,27 @@ class ReaderSurfacesTest {
         controlsVisible: Boolean = false,
         hasAudio: Boolean = false,
         enabled: Boolean = true,
+        followingAudio: Boolean = true,
+        isPlaying: Boolean = true,
+        isPreparing: Boolean = false,
+        fontScale: Float = 1f,
     ): MutableList<String> {
         val events = mutableListOf<String>()
         var visible by mutableStateOf(controlsVisible)
+        var following by mutableStateOf(followingAudio)
         compose.setContent {
-            FreeReadingTheme {
-                ReaderChrome(title = "山间来信", chapter = "第七章 山间", readingProgress = 0.6f,
-                    controlsVisible = visible, hasAudio = hasAudio, isPlaying = true, isPreparing = false,
-                    enabled = enabled, paper = Paper, ink = Ink, accent = Forest,
-                    onBack = { events += "back" }, onContents = { events += "contents" },
-                    onAppearance = { events += "appearance" }, onListen = { events += "listen" },
-                    onToggleControls = { visible = !visible; events += "toggle-tools" })
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
+                FreeReadingTheme {
+                    ReaderChrome(title = "山间来信", chapter = "第七章 山间", readingProgress = 0.6f,
+                        controlsVisible = visible, hasAudio = hasAudio, followingAudio = following,
+                        isPlaying = isPlaying, isPreparing = isPreparing,
+                        enabled = enabled, paper = Paper, ink = Ink, accent = Forest,
+                        onBack = { events += "back" }, onContents = { events += "contents" },
+                        onAppearance = { events += "appearance" }, onListen = { events += "listen" },
+                        onFollowToggle = { following = !following; events += "follow" },
+                        onToggleControls = { visible = !visible; events += "toggle-tools" })
+                }
             }
         }
         return events

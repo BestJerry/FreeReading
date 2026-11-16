@@ -11,6 +11,7 @@ import android.view.ActionMode
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -65,6 +66,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.withStateAtLeast
 import com.freereading.ReadingApplication
 import com.freereading.audio.PlaybackHub
+import com.freereading.audio.PlaybackSnapshot
 import com.freereading.data.ReadingProgress
 import com.freereading.data.SpeechBook
 import com.freereading.data.SpeechSentence
@@ -122,6 +124,7 @@ class ReaderActivity : FragmentActivity() {
     private var showAppearance by mutableStateOf(false)
     private var showReadingControls by mutableStateOf(false)
     private var showListening by mutableStateOf(false)
+    // User preference; browsing can temporarily detach without turning this preference off.
     private var followAudio by mutableStateOf(true)
     private var fontScale by mutableStateOf(1.15f)
     private var pageStyle by mutableStateOf("paper")
@@ -138,15 +141,25 @@ class ReaderActivity : FragmentActivity() {
     private var chapterAnchors: List<SentenceLocatorMatcher.Anchor> = emptyList()
     private var readingOrderHrefs: List<String> = emptyList()
     private var readingPlaybackIntent by mutableStateOf(ReadingPlaybackIntent.CONTINUE_AUDIO)
+    private val followingAudio: Boolean
+        get() = followAudio && readingPlaybackIntent == ReadingPlaybackIntent.CONTINUE_AUDIO
+    private val dragNavigation by lazy {
+        ReaderDragNavigation(ViewConfiguration.get(this).scaledTouchSlop.toFloat())
+    }
     private var requestedReadingStart: Locator? = null
     private var readingNavigationRevision = 0L
     private var readingStartJob: Job? = null
+    private var pendingAudioSentence: Int? = null
+    private var pendingAudioRequestId: String? = null
     private var audioBinding: Job? = null
     private var audioHighlighter: AudioHighlightSynchronizer? = null
     private var audioPageReady = false
     private val sourceResolverMutex = Mutex()
     private var sourceResolver: Pair<String, SourceSentenceResolver>? = null
     private data class VisibleTextSnapshot(val page: Locator, val textAnchor: Locator, val revision: Long)
+    private data class AudioCursor(val bookId: String?, val sentenceIndex: Int,
+                                   val playing: Boolean, val preparing: Boolean, val sessionId: String?,
+                                   val failedStartId: String?)
     private var visibleTextSnapshot: VisibleTextSnapshot? = null
 
     private val paper: Color get() = when (pageStyle) {
@@ -165,6 +178,10 @@ class ReaderActivity : FragmentActivity() {
             runCatching { ReadingPlaybackIntent.valueOf(it) }.getOrNull()
         } ?: ReadingPlaybackIntent.CONTINUE_AUDIO
         requestedReadingStart = savedInstanceState?.getString(STATE_READING_START)?.let(::parseLocator)
+        pendingAudioRequestId = savedInstanceState?.getString(STATE_PENDING_AUDIO_REQUEST)
+            ?.takeIf(PlaybackHub::isCurrentPlaybackSessionId)
+        pendingAudioSentence = savedInstanceState?.getInt(STATE_PENDING_AUDIO_SENTENCE, -1)
+            ?.takeIf { it >= 0 && pendingAudioRequestId != null }
         showReadingControls = savedInstanceState?.getBoolean(STATE_READING_CONTROLS, false) ?: false
         showListening = savedInstanceState?.getBoolean(STATE_LISTENING)
             ?: intent.getBooleanExtra(EXTRA_OPEN_PLAYER, false)
@@ -246,15 +263,22 @@ class ReaderActivity : FragmentActivity() {
         audioHighlighter = null
         audioPageReady = false
         speechBook = book
+        pendingAudioSentence = pendingAudioSentence?.takeIf { it in book.sentences.indices }
+        if (pendingAudioSentence == null) pendingAudioRequestId = null
         publication = opened
         readingOrderHrefs = opened.readingOrder.map { it.url().removeFragment().toString() }
         val audio = PlaybackHub.state.value
+        acknowledgeAudioStart(audio)
         resumableProgress = resolveResumeProgress(book, saved, pendingStoppedProgress,
             audio.bookId, readingPlaybackIntent)
         val stoppedLocator = resumableProgress?.takeIf { pendingStoppedProgress != null }?.locatorJson
+        val pendingAudioLocator = pendingAudioSentence?.let { book.sentences[it].locatorJson }
         val initial = when {
-            followAudio && stoppedLocator != null -> stoppedLocator
-            followAudio && audio.bookId == bookId -> book.sentences.getOrNull(audio.sentenceIndex)?.locatorJson
+            readingPlaybackIntent == ReadingPlaybackIntent.RETRY_AUDIO_START && stoppedLocator != null ->
+                restoredLocator ?: stoppedLocator
+            followingAudio && pendingAudioLocator != null -> pendingAudioLocator
+            followingAudio && stoppedLocator != null -> stoppedLocator
+            followingAudio && audio.bookId == bookId -> book.sentences.getOrNull(audio.sentenceIndex)?.locatorJson
             restoredLocator != null -> restoredLocator
             else -> saved.locatorJson
         }?.let(::parseLocator)
@@ -329,7 +353,7 @@ class ReaderActivity : FragmentActivity() {
             }
 
             override fun onDrag(event: DragEvent): Boolean {
-                if (event.type == DragEvent.Type.Start) markManualNavigation()
+                if (dragNavigation.shouldDetach(event, scroll)) markManualNavigation()
                 return false
             }
         })
@@ -370,8 +394,9 @@ class ReaderActivity : FragmentActivity() {
                         navigate = { fragment.go(it, animated = false) },
                         canNavigate = { target ->
                             val audio = PlaybackHub.state.value
-                            navigator === fragment && fragment.view != null && followAudio &&
+                            navigator === fragment && fragment.view != null && followingAudio &&
                                 owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
+                                pendingAudioSentence == null &&
                                 audio.bookId == target.bookId && audio.sentenceIndex == target.sentenceIndex
                         },
                     )
@@ -379,7 +404,9 @@ class ReaderActivity : FragmentActivity() {
                     if (audioPageReady) synchronizer.onPageLoaded()
                     try {
                         PlaybackHub.state
-                            .map { it.bookId to it.sentenceIndex }
+                            // Starting/resuming the same sentence must also catch up the page.
+                            .map { AudioCursor(it.bookId, it.sentenceIndex, it.isPlaying, it.isPreparing,
+                                it.playbackSessionId, it.startFailure?.requestId) }
                             .distinctUntilChanged()
                             .collect { synchronizeAudio() }
                     } finally {
@@ -393,11 +420,27 @@ class ReaderActivity : FragmentActivity() {
     private fun synchronizeAudio() {
         val synchronizer = audioHighlighter ?: return
         val audio = PlaybackHub.state.value
+        acknowledgeAudioStart(audio)
         val sentence = speechBook?.sentences?.getOrNull(audio.sentenceIndex)
             ?.takeIf { audio.bookId == bookId }
         val locator = sentence?.locatorJson?.let(::parseLocator)
         val target = locator?.let { AudioHighlightSynchronizer.Target(bookId, audio.sentenceIndex, it) }
-        synchronizer.request(target, navigate = followAudio)
+        synchronizer.request(target, navigate = followingAudio)
+    }
+
+    private fun acknowledgeAudioStart(audio: PlaybackSnapshot) {
+        val pending = pendingAudioSentence ?: return
+        val failure = audio.startFailure
+        if (failure != null && failure.requestId == pendingAudioRequestId && failure.bookId == bookId) {
+            audioStartFailed(ReadingProgress(bookId, speechBook?.sentences?.getOrNull(pending)?.locatorJson,
+                pending, failure.positionMs.coerceAtLeast(0)))
+            return
+        }
+        if (audio.bookId != bookId) return
+        if (PlaybackHub.isPlaybackStartConfirmed(pendingAudioRequestId, audio.playbackSessionId)) {
+            // A hidden/recreated reader can miss the requested sentence and return at the next.
+            clearPendingAudioStart()
+        }
     }
 
     private suspend fun saveReadingLocation(fragment: EpubNavigatorFragment, page: Locator) {
@@ -475,19 +518,33 @@ class ReaderActivity : FragmentActivity() {
     private fun markManualNavigation() {
         showReadingControls = false
         cancelReadingStart()
+        clearPendingAudioStart()
         readingPlaybackIntent = ReadingPlaybackIntent.FROM_READING_LOCATION
         requestedReadingStart = null
-        followAudio = false
         resumableProgress = null
         pendingStoppedProgress = null
     }
 
     private fun followCurrentAudio() {
         cancelReadingStart()
+        clearPendingAudioStart()
+        if (readingPlaybackIntent == ReadingPlaybackIntent.RETRY_AUDIO_START) {
+            resumableProgress = null
+            pendingStoppedProgress = null
+        }
         readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
         requestedReadingStart = null
         followAudio = true
         synchronizeAudio()
+    }
+
+    private fun toggleAudioFollow() {
+        if (followingAudio) {
+            followAudio = false
+            synchronizeAudio()
+        } else {
+            followCurrentAudio()
+        }
     }
 
     private fun cancelReadingStart() {
@@ -495,6 +552,11 @@ class ReaderActivity : FragmentActivity() {
         readingStartJob = null
         readingNavigationRevision += 1
         visibleTextSnapshot = null
+    }
+
+    private fun clearPendingAudioStart() {
+        pendingAudioSentence = null
+        pendingAudioRequestId = null
     }
 
     private fun anchorsFor(locator: Locator): List<SentenceLocatorMatcher.Anchor> {
@@ -549,6 +611,7 @@ class ReaderActivity : FragmentActivity() {
 
     private fun playFromReadingLocation(requested: Locator? = requestedReadingStart) {
         val fragment = navigator ?: return
+        readingPlaybackIntent = ReadingPlaybackIntent.FROM_READING_LOCATION
         resumableProgress = null
         pendingStoppedProgress = null
         val revision = readingNavigationRevision
@@ -589,10 +652,28 @@ class ReaderActivity : FragmentActivity() {
     }
 
     private fun startSentence(sentence: SpeechSentence) {
+        requestAudioStart(ReadingProgress(bookId, sentence.locatorJson, sentence.index))
+    }
+
+    private fun requestAudioStart(progress: ReadingProgress) {
+        // Correlate the queued command before startService can publish or fail synchronously.
+        val requestId = PlaybackHub.newPlaybackSessionId()
+        resumableProgress = null
+        pendingStoppedProgress = null
+        pendingAudioSentence = progress.sentenceIndex
+        pendingAudioRequestId = requestId
         readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
         requestedReadingStart = null
-        followAudio = true
-        PlaybackHub.playBook(this, bookId, sentence.index)
+        if (!PlaybackHub.playBook(this, bookId, progress.sentenceIndex, progress.audioOffsetMs, requestId)) {
+            audioStartFailed(progress)
+        }
+    }
+
+    private fun audioStartFailed(progress: ReadingProgress) {
+        clearPendingAudioStart()
+        readingPlaybackIntent = ReadingPlaybackIntent.RETRY_AUDIO_START
+        resumableProgress = progress
+        pendingStoppedProgress = progress
     }
 
     private fun resumeOrPlayFromPage() {
@@ -602,15 +683,13 @@ class ReaderActivity : FragmentActivity() {
         } else {
             resumableProgress = null
             pendingStoppedProgress = null
-            readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
-            requestedReadingStart = null
-            followAudio = true
-            PlaybackHub.playBook(this, bookId, saved.sentenceIndex, saved.audioOffsetMs)
+            requestAudioStart(saved)
         }
     }
 
     private val selectionMenu = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            markManualNavigation()
             menu.add(Menu.NONE, SELECTION_LISTEN_ID, 0, "从这里听")
                 .setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             return true
@@ -675,6 +754,9 @@ class ReaderActivity : FragmentActivity() {
         outState.putBoolean(STATE_FOLLOW, followAudio)
         outState.putString(STATE_PLAYBACK_INTENT, readingPlaybackIntent.name)
         outState.putString(STATE_READING_START, requestedReadingStart?.toJSON()?.toString())
+        pendingAudioSentence?.let { outState.putInt(STATE_PENDING_AUDIO_SENTENCE, it) }
+            ?: outState.remove(STATE_PENDING_AUDIO_SENTENCE)
+        outState.putString(STATE_PENDING_AUDIO_REQUEST, pendingAudioRequestId)
         outState.putBoolean(STATE_READING_CONTROLS, showReadingControls)
         outState.putBoolean(STATE_LISTENING, showListening)
         pendingStoppedProgress?.let { progress ->
@@ -737,6 +819,8 @@ class ReaderActivity : FragmentActivity() {
             onAppearance = { showReadingControls = false; showAppearance = true },
             onListen = { showReadingControls = false; showListening = true },
             onToggleControls = { showReadingControls = !showReadingControls },
+            followingAudio = followingAudio,
+            onFollowToggle = ::toggleAudioFollow,
         )
         if (showContents) ContentsDialog()
         if (showAppearance) AppearanceDialog()
@@ -751,14 +835,14 @@ class ReaderActivity : FragmentActivity() {
             ) {
                 ListeningPlayerScreen(
                     bookTitle = title, author = book?.author.orEmpty(), coverPath = book?.coverPath,
-                    snapshot = audio, activeBook = activeBook, enabled = enabled, followAudio = followAudio,
+                    snapshot = audio, activeBook = activeBook, enabled = enabled, followAudio = followingAudio,
                     paper = paper, ink = ink, accent = accent,
                     onClose = { showListening = false },
                     onToggle = ::toggleListening,
                     onSeek = { PlaybackHub.seekBy(this, it) },
                     onSpeed = { PlaybackHub.setSpeed(this, it) },
                     onFromReading = ::playFromVisibleParagraph,
-                    onFollowToggle = { if (followAudio) followAudio = false else followCurrentAudio() },
+                    onFollowToggle = ::toggleAudioFollow,
                     onLocate = { showListening = false; showReadingControls = false; followCurrentAudio() },
                     onStop = ::stopListening,
                     onVoiceSettings = { PlaybackHub.openVoiceSettings(this) },
@@ -779,6 +863,9 @@ class ReaderActivity : FragmentActivity() {
         if (pendingStoppedProgress != null) {
             if (readingPlaybackIntent == ReadingPlaybackIntent.FROM_READING_LOCATION) {
                 playFromReadingLocation()
+            } else if (readingPlaybackIntent == ReadingPlaybackIntent.RETRY_AUDIO_START &&
+                primaryPlaybackAction(audio, bookId, readingPlaybackIntent) == PrimaryPlaybackAction.PAUSE_OR_TOGGLE) {
+                PlaybackHub.toggle(this)
             } else {
                 resumeOrPlayFromPage()
             }
@@ -793,6 +880,7 @@ class ReaderActivity : FragmentActivity() {
 
     private fun stopListening() {
         cancelReadingStart()
+        clearPendingAudioStart()
         showListening = false
         val audio = PlaybackHub.state.value
         if (audio.bookId != bookId) return
@@ -917,6 +1005,8 @@ class ReaderActivity : FragmentActivity() {
         private const val STATE_FOLLOW = "reader_follow_audio"
         private const val STATE_PLAYBACK_INTENT = "reader_playback_intent"
         private const val STATE_READING_START = "reader_requested_start"
+        private const val STATE_PENDING_AUDIO_SENTENCE = "reader_pending_audio_sentence"
+        private const val STATE_PENDING_AUDIO_REQUEST = "reader_pending_audio_request"
         private const val STATE_READING_CONTROLS = "reader_controls_visible"
         private const val STATE_LISTENING = "reader_listening_visible"
         private const val STATE_STOPPED_PROGRESS = "reader_stopped_progress"

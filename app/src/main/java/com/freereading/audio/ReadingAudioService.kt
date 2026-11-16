@@ -162,19 +162,26 @@ class ReadingAudioService : MediaSessionService() {
         }
         when (intent?.action) {
             ACTION_PLAY_BOOK -> {
+                val id = intent.getStringExtra(EXTRA_BOOK_ID)
+                val requestId = intent.getStringExtra(EXTRA_PLAYBACK_SESSION_ID)
                 // startForegroundService's deadline includes EPUB parsing and TTS initialization.
                 // Fulfil it before launching either operation.
                 try { showPreparingNotification() }
                 catch (_: RuntimeException) {
-                    PlaybackHub.publish(PlaybackHub.state.value.copy(isPreparing = false,
-                        isPlaying = false, error = getString(R.string.audio_start_failed)))
+                    val old = PlaybackHub.state.value
+                    val startFailure = if (requestId != null && !id.isNullOrBlank()) {
+                        PlaybackStartFailure(requestId, id, intent.getIntExtra(EXTRA_INDEX, -1),
+                            intent.getLongExtra(EXTRA_POSITION, 0).coerceAtLeast(0))
+                    } else old.startFailure
+                    PlaybackHub.publish(old.copy(isPreparing = false, isPlaying = false,
+                        error = getString(R.string.audio_start_failed), startFailure = startFailure))
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                val id = intent.getStringExtra(EXTRA_BOOK_ID)
                 if (id.isNullOrBlank()) { stopPlayback(); return START_NOT_STICKY }
                 playBook(id, intent.getIntExtra(EXTRA_INDEX, -1),
-                    intent.getLongExtra(EXTRA_POSITION, 0))
+                    intent.getLongExtra(EXTRA_POSITION, 0),
+                    requestId ?: PlaybackHub.newPlaybackSessionId())
             }
             ACTION_TOGGLE -> requestPlayback(if (player.playbackState == Player.STATE_ENDED)
                 true else !player.playWhenReady)
@@ -192,13 +199,15 @@ class ReadingAudioService : MediaSessionService() {
         return START_NOT_STICKY
     }
 
-    private fun playBook(id: String, index: Int, offsetMs: Long) {
+    private fun playBook(id: String, index: Int, offsetMs: Long,
+                         playbackSessionId: String = PlaybackHub.newPlaybackSessionId()) {
         relativeSeeks.clear()
         val previousProgress = captureProgress()
         book = null
         PlaybackHub.publish(PlaybackSnapshot(bookId = id,
             bookTitle = repository.books.value.firstOrNull { it.id == id }?.title.orEmpty(),
-            sentenceIndex = index.coerceAtLeast(0), speed = player.playbackParameters.speed))
+            sentenceIndex = index.coerceAtLeast(0), speed = player.playbackParameters.speed,
+            playbackSessionId = playbackSessionId))
         player.playWhenReady = true
         beginTransition { token ->
             previousProgress?.let { persist(it) }
@@ -463,7 +472,8 @@ class ReadingAudioService : MediaSessionService() {
             chapterProgressIndex = null
             speech.protect(emptyList())
             transitionToken = null
-            PlaybackHub.publish(PlaybackSnapshot(speed = player.playbackParameters.speed))
+            PlaybackHub.publish(PlaybackSnapshot(speed = player.playbackParameters.speed,
+                startFailure = PlaybackHub.state.value.startFailure))
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -532,7 +542,8 @@ class ReadingAudioService : MediaSessionService() {
         session.release()
         player.release()
         PlaybackHub.serviceAlive = false
-        PlaybackHub.publish(PlaybackSnapshot(speed = PlaybackHub.state.value.speed))
+        PlaybackHub.publish(PlaybackSnapshot(speed = PlaybackHub.state.value.speed,
+            startFailure = PlaybackHub.state.value.startFailure))
         // onDestroy cannot suspend. The repository never recreates a removed book directory.
         if (progress != null) CoroutineScope(Dispatchers.IO).launch {
             storeMutex.withLock {
@@ -557,6 +568,7 @@ class ReadingAudioService : MediaSessionService() {
         internal const val EXTRA_BOOK_ID = "book_id"
         internal const val EXTRA_INDEX = "sentence_index"
         internal const val EXTRA_POSITION = "position_ms"
+        internal const val EXTRA_PLAYBACK_SESSION_ID = "playback_session_id"
         internal const val EXTRA_DELTA = "delta_ms"
         internal const val EXTRA_SPEED = "speed"
         private const val SEEK_MS = 15_000L

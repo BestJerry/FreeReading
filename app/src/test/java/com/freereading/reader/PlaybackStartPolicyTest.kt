@@ -85,4 +85,32 @@ class PlaybackStartPolicyTest {
                 ReadingPlaybackIntent.FROM_READING_LOCATION),
         )
     }
+
+    @Test fun aFailedStartRetriesTheSavedRequestInsteadOfResumingTheOldPausedCursor() {
+        for (snapshot in listOf(pausedAudio, pausedAudio.copy(error = "听书启动失败"))) {
+            assertEquals(
+                PrimaryPlaybackAction.RESUME_SAVED_OR_READING,
+                primaryPlaybackAction(snapshot, currentBook, ReadingPlaybackIntent.RETRY_AUDIO_START),
+            )
+        }
+    }
+
+    @Test fun aRetryStillPausesTheSameBookWhileItsExistingAudioIsPlayingOrPreparing() {
+        for (snapshot in listOf(pausedAudio.copy(isPlaying = true), pausedAudio.copy(isPreparing = true))) {
+            assertEquals(
+                PrimaryPlaybackAction.PAUSE_OR_TOGGLE,
+                primaryPlaybackAction(snapshot, currentBook, ReadingPlaybackIntent.RETRY_AUDIO_START),
+            )
+        }
+    }
+
+    @Test fun aRetryWithoutThisBooksActiveAudioUsesTheSavedRequest() {
+        for (snapshot in listOf(PlaybackSnapshot(), pausedAudio.copy(bookId = "another-book"),
+            pausedAudio.copy(bookId = "another-book", isPlaying = true))) {
+            assertEquals(
+                PrimaryPlaybackAction.RESUME_SAVED_OR_READING,
+                primaryPlaybackAction(snapshot, currentBook, ReadingPlaybackIntent.RETRY_AUDIO_START),
+            )
+        }
+    }
 }
