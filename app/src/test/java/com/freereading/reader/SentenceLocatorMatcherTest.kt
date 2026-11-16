@@ -5,6 +5,16 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class SentenceLocatorMatcherTest {
+    @Test fun aWholeRepeatedParagraphStartsAtItsFirstSentenceInsteadOfTheMiddle() {
+        val candidates = List(200) { index ->
+            SentenceLocatorMatcher.Anchor(index, "#paragraph", "甲。".repeat(index), "甲。",
+                "甲。".repeat(199 - index))
+        }
+        val paragraph = SentenceLocatorMatcher.Anchor(-1, "#paragraph", "", "甲。".repeat(200), "")
+
+        assertEquals(0, SentenceLocatorMatcher.find(candidates, paragraph))
+    }
+
     private fun anchor(
         index: Int,
         text: String,
@@ -38,6 +48,26 @@ class SentenceLocatorMatcherTest {
         )
         assertEquals(1, SentenceLocatorMatcher.find(candidates,
             anchor(-1, "回来了", before = "第三天，他终于", after = "。雨停了。")))
+    }
+
+    @Test fun partialSelectionStillChecksLaterOccurrencesWithinOneSentence() {
+        val candidates = listOf(
+            anchor(0, "XtermYtermZ"),
+            anchor(1, "YtermQ"),
+        )
+
+        assertEquals(0, SentenceLocatorMatcher.find(candidates,
+            anchor(-1, "term", before = "Y", after = "Z")))
+    }
+
+    @Test fun spanningContextIncludesOutsideTextWhenTheTargetPrefixAndSuffixAreShort() {
+        val candidates = listOf(
+            anchor(0, "开始。", before = "其他前文", after = "其他后文"),
+            anchor(1, "开始。", before = "段外前文前言", after = "尾声段外后文"),
+        )
+
+        assertEquals(1, SentenceLocatorMatcher.find(candidates,
+            anchor(-1, "前言开始。尾声", before = "段外前文", after = "段外后文")))
     }
 
     @Test fun firstVisibleParagraphStartsAtFirstSentence() {

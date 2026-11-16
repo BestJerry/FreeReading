@@ -473,10 +473,7 @@ class ReaderActivity : FragmentActivity() {
         val chapter = readingOrderHrefs.indexOf(href)
         if (chapter < 0) return emptyList()
         if (lastAnchorChapter != chapter) {
-            chapterAnchors = book.sentences.asSequence()
-                .filter { it.chapterIndex == chapter }
-                .mapNotNull { sentence -> parseLocator(sentence.locatorJson)?.toAnchor(sentence.index) }
-                .toList()
+            chapterAnchors = SpeechSentenceAnchors.build(book.sentences.asSequence().filter { it.chapterIndex == chapter })
             lastAnchorChapter = chapter
         }
         return chapterAnchors

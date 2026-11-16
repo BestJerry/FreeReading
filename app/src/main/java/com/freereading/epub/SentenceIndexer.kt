@@ -2,14 +2,15 @@
 
 package com.freereading.epub
 
+import com.freereading.data.SpeechIndexLimits
 import com.freereading.data.SpeechSentence
+import com.freereading.data.SpeechSource
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import org.readium.r2.shared.publication.Link
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.services.content.Content
-import org.readium.r2.shared.publication.services.content.ContentTokenizer
 import org.readium.r2.shared.publication.services.content.content
 
 /** The persisted order is independent of page layout, Android ICU version and playback speed. */
@@ -23,39 +24,51 @@ class SentenceIndexer {
         val titles = flatten(publication.tableOfContents).associate { link ->
             link.url().removeFragment().removeQuery().toString() to link.title.orEmpty()
         }
-        val tokenizer = SentenceContentTokenizer()
         val sentences = ArrayList<SpeechSentence>()
-        var locatorCharacters = 0L
+        var sourceLocatorCharacters = 0L
         var textCharacters = 0L
         val iterator = content.iterator()
         while (iterator.hasNext()) {
             currentCoroutineContext().ensureActive()
-            val element = iterator.next()
-            for (tokenized in tokenizer.tokenize(element)) {
-                if (tokenized !is Content.TextElement) continue
-                for (segment in tokenized.segments) {
+            val element = iterator.next() as? Content.TextElement ?: continue
+            if (element.segments.sumOf { (it.locator.text.highlight ?: it.text).length.toLong() } >
+                SpeechIndexLimits.MAX_BLOCK_CHARACTERS
+            ) {
+                throw BookImportException("书籍包含过长的正文段落，暂不支持建立听书索引")
+            }
+            for (segment in element.segments) {
+                currentCoroutineContext().ensureActive()
+                // Readium's original highlight retains source whitespace and repeated text.
+                val text = segment.locator.text.highlight ?: segment.text
+                val ranges = SentenceRanges.split(text)
+                if (ranges.isEmpty()) continue
+                val key = segment.locator.href.removeFragment().removeQuery().toString()
+                val chapter = chapterByHref[key]
+                    ?: throw BookImportException("正文位置与 EPUB 章节不一致，无法建立听书索引")
+                val locator = if (segment.locator.text.highlight == null) {
+                    segment.locator.copy(text = Locator.Text(highlight = text))
+                } else segment.locator
+                // Store each original locator once. Expanding before/after for every sentence
+                // is quadratic for long paragraphs, and also repeats all JSON fields per sentence.
+                sourceLocatorCharacters += locator.toJSON().toString().length
+                if (sourceLocatorCharacters > SpeechIndexLimits.MAX_SOURCE_LOCATOR_CHARACTERS) {
+                    throw BookImportException("书籍定位信息过大，暂不支持导入")
+                }
+                val title = titles[key].orEmpty().ifBlank {
+                    publication.readingOrder[chapter].title.orEmpty()
+                }.take(2048)
+                val source = SpeechSource(locator, chapter, title)
+                for (range in ranges) {
                     currentCoroutineContext().ensureActive()
-                    val key = segment.locator.href.removeFragment().removeQuery().toString()
-                    val chapter = chapterByHref[key]
-                        ?: throw BookImportException("正文位置与 EPUB 章节不一致，无法建立听书索引")
-                    val locatorJson = segment.locator.toJSON().toString()
-                    locatorCharacters += locatorJson.length
-                    textCharacters += segment.text.length
-                    if (sentences.size >= 100_000 || textCharacters > 8_000_000L ||
-                        locatorCharacters > 32_000_000L
-                    ) {
-                        throw BookImportException("书籍正文或位置索引过大，暂不支持导入")
+                    if (sentences.size >= SpeechIndexLimits.MAX_SENTENCES) {
+                        throw BookImportException("书籍句子数量超过50万句，暂不支持导入")
+                    }
+                    textCharacters += range.last - range.first + 1
+                    if (textCharacters > SpeechIndexLimits.MAX_TEXT_CHARACTERS) {
+                        throw BookImportException("书籍正文超过2000万字符，暂不支持导入")
                     }
                     sentences.add(
-                        SpeechSentence(
-                            index = sentences.size,
-                            text = segment.text,
-                            locatorJson = locatorJson,
-                            chapterIndex = chapter,
-                            chapterTitle = titles[key].orEmpty().ifBlank {
-                                publication.readingOrder[chapter].title.orEmpty()
-                            }.take(2048),
-                        )
+                        SpeechSentence(sentences.size, source, range.first, range.last + 1)
                     )
                 }
             }
@@ -70,34 +83,6 @@ class SentenceIndexer {
         for (link in links) {
             add(link)
             addAll(flatten(link.children))
-        }
-    }
-
-    /**
-     * Work from Readium's original locator text, not normalized display text. substring() retains
-     * the source selector and exact before/after context, including repeated sentences in a block.
-     */
-    internal class SentenceContentTokenizer : ContentTokenizer {
-        override fun tokenize(data: Content.Element): List<Content.Element> {
-            if (data !is Content.TextElement) return emptyList()
-            if (data.segments.sumOf { (it.locator.text.highlight ?: it.text).length.toLong() } > 65_536L) {
-                throw BookImportException("书籍包含过长的正文段落，暂不支持建立听书索引")
-            }
-            val segments = data.segments.flatMap { segment ->
-                val source = segment.locator.text.highlight ?: segment.text
-                val locator = if (segment.locator.text.highlight == null) {
-                    segment.locator.copy(text = Locator.Text(highlight = source))
-                } else {
-                    segment.locator
-                }
-                SentenceRanges.split(source).map { range ->
-                    segment.copy(
-                        text = source.substring(range),
-                        locator = locator.copy(text = locator.text.substring(range)),
-                    )
-                }
-            }
-            return listOf(data.copy(segments = segments))
         }
     }
 }

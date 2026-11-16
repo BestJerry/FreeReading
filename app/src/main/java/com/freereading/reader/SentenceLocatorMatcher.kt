@@ -4,19 +4,49 @@ package com.freereading.reader
 internal object SentenceLocatorMatcher {
     private val whitespace = Regex("\\s+")
 
-    data class Anchor(
+    class Anchor(
         val index: Int,
         val selector: String?,
-        val before: String,
-        val text: String,
-        val after: String,
-    )
+        private val content: Text,
+    ) {
+        interface Text {
+            val before: String
+            val text: String
+            val after: String
+        }
+
+        constructor(index: Int, selector: String?, before: String, text: String, after: String) :
+            this(index, selector, FixedText(before, text, after))
+
+        val before: String get() = content.before
+        val text: String get() = content.text
+        val after: String get() = content.after
+
+        private class FixedText(
+            override val before: String,
+            override val text: String,
+            override val after: String,
+        ) : Text
+    }
 
     fun find(candidates: List<Anchor>, target: Anchor): Int? {
         if (candidates.isEmpty()) return null
         val targetText = normalize(target.text)
         val targetBefore = normalize(target.before).takeLast(160)
         val targetAfter = normalize(target.after).take(160)
+        // Cache repeated short sentences, including misses, without retaining a chapter-sized map.
+        val targetOffsets = LinkedHashMap<String, Int>(256, 0.75f, true)
+        fun firstOffsetInTarget(text: String): Int {
+            targetOffsets[text]?.let { return it }
+            val offset = targetText.indexOf(text)
+            if (targetOffsets.size >= 256) {
+                val oldest = targetOffsets.entries.iterator()
+                oldest.next()
+                oldest.remove()
+            }
+            targetOffsets[text] = offset
+            return offset
+        }
         val sameElement = target.selector?.takeIf(String::isNotBlank)?.let { selector ->
             candidates.filter { it.selector == selector }.takeIf(List<Anchor>::isNotEmpty)
         }
@@ -25,14 +55,22 @@ internal object SentenceLocatorMatcher {
         val textMatches = if (targetText.isNotEmpty()) {
             val contained = candidates.filter { normalize(it.text).contains(targetText) }
             if (contained.isNotEmpty()) contained else {
-                val spanning = candidates.filter { candidate ->
-                    normalize(candidate.text).let { it.isNotEmpty() && targetText.contains(it) }
-                }
                 // A visible paragraph or a long selection may cover several sentences. Start
                 // with its first matching sentence instead of a later sentence with more context.
-                val firstOffset = spanning.minOfOrNull { targetText.indexOf(normalize(it.text)) }
-                spanning.filter { targetText.indexOf(normalize(it.text)) == firstOffset }
-                    .takeIf(List<Anchor>::isNotEmpty)
+                val spanning = ArrayList<Anchor>()
+                var firstOffset = Int.MAX_VALUE
+                for (candidate in candidates) {
+                    val text = normalize(candidate.text)
+                    if (text.isEmpty()) continue
+                    val offset = firstOffsetInTarget(text)
+                    if (offset < 0 || offset > firstOffset) continue
+                    if (offset < firstOffset) {
+                        firstOffset = offset
+                        spanning.clear()
+                    }
+                    spanning.add(candidate)
+                }
+                spanning.takeIf(List<Anchor>::isNotEmpty)
             }
         } else null
         // Page progression and ContentService progression use different denominators.
@@ -42,6 +80,7 @@ internal object SentenceLocatorMatcher {
             val before = normalize(candidate.before).takeLast(160)
             val after = normalize(candidate.after).take(160)
             val text = normalize(candidate.text)
+            val targetOffset = if (text.isNotEmpty() && text.length <= targetText.length) firstOffsetInTarget(text) else -1
             val contextScore = when {
                 targetText.isNotEmpty() && text.contains(targetText) -> {
                     // Selection context is relative to the selected words, not the whole
@@ -51,11 +90,11 @@ internal object SentenceLocatorMatcher {
                             commonPrefix(text.drop(start + targetText.length) + after, targetAfter)
                     }
                 }
-                text.isNotEmpty() && targetText.contains(text) -> {
-                    occurrences(targetText, text).maxOf { start ->
-                        commonSuffix(before, targetBefore + targetText.take(start)) +
-                            commonPrefix(after, targetText.drop(start + text.length) + targetAfter)
-                    }
+                targetOffset >= 0 -> {
+                    // The spanning pass selected the earliest occurrence in this paragraph.
+                    // Comparing against every later repeat can incorrectly favor a middle sentence.
+                    commonSuffix(before, precedingContext(targetBefore, targetText, targetOffset, before.length)) +
+                        commonPrefix(after, followingContext(targetText, targetOffset + text.length, targetAfter, after.length))
                 }
                 else -> commonSuffix(before, targetBefore) + commonPrefix(after, targetAfter)
             }
@@ -63,7 +102,7 @@ internal object SentenceLocatorMatcher {
                 targetText.isEmpty() -> 0
                 text == targetText -> 200
                 text.contains(targetText) -> 160
-                targetText.contains(text) && text.isNotEmpty() -> 120
+                targetOffset >= 0 -> 120
                 else -> 0
             }
             val selectorScore = if (target.selector != null && candidate.selector == target.selector) 80 else 0
@@ -73,6 +112,16 @@ internal object SentenceLocatorMatcher {
     }
 
     private fun normalize(value: String): String = value.replace(whitespace, " ").trim()
+
+    private fun precedingContext(prefix: String, text: String, end: Int, limit: Int): String {
+        val fromText = minOf(end, limit)
+        return prefix.takeLast(limit - fromText) + text.substring(end - fromText, end)
+    }
+
+    private fun followingContext(text: String, start: Int, suffix: String, limit: Int): String {
+        val fromText = minOf(text.length - start, limit)
+        return text.substring(start, start + fromText) + suffix.take(limit - fromText)
+    }
 
     private fun occurrences(text: String, term: String): List<Int> = buildList {
         var start = text.indexOf(term)

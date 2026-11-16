@@ -6,8 +6,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.AtomicFile
-import android.util.JsonReader
-import android.util.JsonWriter
 import android.util.Log
 import com.freereading.epub.BookImportException
 import com.freereading.epub.ReadiumEngine
@@ -15,8 +13,7 @@ import com.freereading.epub.SentenceIndexer
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
+import java.lang.ref.WeakReference
 import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -41,6 +38,8 @@ class BookRepository(context: Context) {
     private val mutations = Mutex()
     private val progressLock = Any()
     private val progressCache = HashMap<String, ReadingProgress>()
+    private val indexStore = SpeechIndexStore()
+    private val speechBookCache = HashMap<String, CachedSpeechBook>()
     private val mutableBooks = MutableStateFlow<List<BookRecord>>(emptyList())
     val books: StateFlow<List<BookRecord>> = mutableBooks.asStateFlow()
     val readium = ReadiumEngine(appContext)
@@ -94,6 +93,7 @@ class BookRepository(context: Context) {
                 writeRecord(File(staging, METADATA_FILE), speechBook.book)
                 currentCoroutineContext().ensureActive()
                 if (!staging.renameTo(destination)) throw BookImportException("无法保存书籍，请检查设备剩余空间")
+                cacheBook(destination, speechBook)
                 refreshLocked()
                 speechBook.book
             } catch (error: CancellationException) {
@@ -115,13 +115,20 @@ class BookRepository(context: Context) {
             try {
                 val record = readRecord(dir)
                 if (!File(dir, BOOK_FILE).isFile) throw BookImportException("书籍原文件已不存在，请重新导入")
+                val stamp = cacheStamp(dir)
+                val cached = speechBookCache[bookId]
+                if (stamp != null && cached?.record == record && cached.stamp == stamp) {
+                    cached.reference.get()?.let { return@withLock it }
+                }
                 val sentences = readIndex(File(dir, INDEX_FILE), record)
-                SpeechBook(record, sentences)
+                SpeechBook(record, sentences).also { cacheBook(dir, it) }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: BookImportException) {
+                speechBookCache.remove(bookId)
                 throw error
             } catch (error: Exception) {
+                speechBookCache.remove(bookId)
                 throw BookImportException("听书索引无法读取，请移除书籍后重新导入", error)
             }
         }
@@ -168,6 +175,7 @@ class BookRepository(context: Context) {
             synchronized(progressLock) {
                 if (dir.exists() && !dir.renameTo(trash)) throw IOException("无法移除书籍，请稍后重试")
                 progressCache.remove(bookId)
+                speechBookCache.remove(bookId)
                 mutableBooks.value = mutableBooks.value.filterNot { it.id == bookId }
             }
             // Rename is the commit point. Interrupted cleanup is retried by refresh().
@@ -231,16 +239,17 @@ class BookRepository(context: Context) {
                 }
             }
             .sortedByDescending { it.addedAt }
+        speechBookCache.keys.retainAll(mutableBooks.value.map { it.id }.toSet())
     }
 
     private fun readRecord(directory: File): BookRecord {
         val json = readSmallJson(File(directory, METADATA_FILE))
         val id = json.getString("id")
-        if (id != directory.name || !BOOK_ID.matches(id) || json.getInt("version") != INDEX_VERSION) {
+        if (id != directory.name || !BOOK_ID.matches(id) || json.getInt("version") != BOOK_RECORD_VERSION) {
             throw BookImportException("书籍记录无效，请移除后重新导入")
         }
         val count = json.getInt("sentenceCount")
-        if (count !in 1..100_000) throw BookImportException("书籍句子索引无效，请重新导入")
+        if (count !in 1..SpeechIndexLimits.MAX_SENTENCES) throw BookImportException("书籍句子索引无效，请重新导入")
         return BookRecord(
             id = id,
             title = json.getString("title"),
@@ -292,7 +301,7 @@ class BookRepository(context: Context) {
 
     private fun writeRecord(file: File, book: BookRecord) {
         val json = JSONObject().apply {
-            put("version", INDEX_VERSION)
+            put("version", BOOK_RECORD_VERSION)
             put("id", book.id)
             put("title", book.title)
             put("author", book.author)
@@ -303,89 +312,28 @@ class BookRepository(context: Context) {
         atomicWrite(file) { it.write(json.toString().toByteArray(Charsets.UTF_8)) }
     }
 
-    private suspend fun writeIndex(file: File, speechBook: SpeechBook) {
-        atomicWrite(file) { output ->
-            val writer = JsonWriter(OutputStreamWriter(output, Charsets.UTF_8))
-            writer.beginObject().name("version").value(INDEX_VERSION)
-            writer.name("bookId").value(speechBook.book.id)
-            writer.name("sentences").beginArray()
-            for (sentence in speechBook.sentences) {
-                currentCoroutineContext().ensureActive()
-                writer.beginObject()
-                writer.name("index").value(sentence.index)
-                writer.name("text").value(sentence.text)
-                writer.name("locatorJson").value(sentence.locatorJson)
-                writer.name("chapterIndex").value(sentence.chapterIndex)
-                writer.name("chapterTitle").value(sentence.chapterTitle)
-                writer.endObject()
-            }
-            writer.endArray().endObject()
-            writer.flush()
-        }
+    private suspend fun writeIndex(file: File, speechBook: SpeechBook) = indexStore.write(file, speechBook)
+
+    private suspend fun readIndex(file: File, record: BookRecord): List<SpeechSentence> =
+        indexStore.read(file, record.id, record.sentenceCount)
+
+    private data class FileStamp(val length: Long, val modified: Long)
+    private data class CachedSpeechBook(
+        val record: BookRecord,
+        val stamp: List<FileStamp>,
+        val reference: WeakReference<SpeechBook>,
+    )
+
+    private fun cacheStamp(dir: File): List<FileStamp>? {
+        val files = listOf(BOOK_FILE, METADATA_FILE, INDEX_FILE).map { File(dir, it) }
+        if (files.any { !it.isFile }) return null
+        return files.map { FileStamp(it.length(), it.lastModified()) }
     }
 
-    private suspend fun readIndex(file: File, record: BookRecord): List<SpeechSentence> {
-        val sentences = ArrayList<SpeechSentence>(record.sentenceCount)
-        var version = -1
-        var bookId: String? = null
-        var foundSentences = false
-        AtomicFile(file).openRead().use { input ->
-            if (input.channel.size() > 128L * 1024L * 1024L) throw IOException("Speech index is too large")
-            JsonReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
-                reader.beginObject()
-                while (reader.hasNext()) {
-                    when (reader.nextName()) {
-                        "version" -> version = reader.nextInt()
-                        "bookId" -> bookId = reader.nextString()
-                        "sentences" -> {
-                            if (foundSentences) throw IOException("Duplicate sentence index")
-                            foundSentences = true
-                            reader.beginArray()
-                            while (reader.hasNext()) {
-                                currentCoroutineContext().ensureActive()
-                                if (sentences.size >= record.sentenceCount) throw IOException("Unexpected sentence count")
-                                sentences.add(readSentence(reader, sentences.size))
-                            }
-                            reader.endArray()
-                        }
-                        else -> reader.skipValue()
-                    }
-                }
-                reader.endObject()
-            }
+    private fun cacheBook(dir: File, book: SpeechBook) {
+        cacheStamp(dir)?.let { stamp ->
+            speechBookCache[book.book.id] = CachedSpeechBook(book.book, stamp, WeakReference(book))
         }
-        if (version != INDEX_VERSION || bookId != record.id || sentences.size != record.sentenceCount) {
-            throw BookImportException("听书索引版本或内容不完整，请移除书籍后重新导入")
-        }
-        return sentences
-    }
-
-    private fun readSentence(reader: JsonReader, expectedIndex: Int): SpeechSentence {
-        var index = -1
-        var text: String? = null
-        var locator: String? = null
-        var chapter = -1
-        var title = ""
-        reader.beginObject()
-        while (reader.hasNext()) {
-            when (reader.nextName()) {
-                "index" -> index = reader.nextInt()
-                "text" -> text = reader.nextString()
-                "locatorJson" -> locator = reader.nextString()
-                "chapterIndex" -> chapter = reader.nextInt()
-                "chapterTitle" -> title = reader.nextString()
-                else -> reader.skipValue()
-            }
-        }
-        reader.endObject()
-        val sentenceText = text ?: throw IOException("Missing sentence text")
-        val sentenceLocator = locator ?: throw IOException("Missing sentence locator")
-        if (index != expectedIndex || chapter < 0 || sentenceText.isBlank() || sentenceText.length > 500 ||
-            sentenceLocator.length > 131_072 || Locator.fromJSON(JSONObject(sentenceLocator)) == null
-        ) {
-            throw IOException("Invalid sentence index")
-        }
-        return SpeechSentence(index, sentenceText, sentenceLocator, chapter, title)
     }
 
     private fun readProgress(dir: File, bookId: String): ReadingProgress = try {
@@ -430,7 +378,7 @@ class BookRepository(context: Context) {
         private const val INDEX_FILE = "speech.json"
         private const val PROGRESS_FILE = "progress.json"
         private const val COVER_FILE = "cover.jpg"
-        private const val INDEX_VERSION = 1
+        private const val BOOK_RECORD_VERSION = 1
         private val BOOK_ID = Regex("[a-f0-9]{64}")
     }
 }
