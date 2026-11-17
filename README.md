@@ -2,14 +2,14 @@
 
 FreeReading 是使用 **Kotlin 和 Jetpack Compose** 开发的 Android 原生本地 EPUB 阅读器，提供阅读与系统 TTS 听书之间的句级定位。
 
-当前版本：**0.1.9**。支持 **Android 8.0（API 26）及以上**。
+当前版本：**0.1.10**。支持 **Android 8.0（API 26）及以上**。
 
 ## 下载安装
 
-当前测试安装包为 **v0.1.9**，新增听书上一章／下一章按钮；阅读页任意区域轻触均展开或收起菜单，使用滑动翻页。
+当前测试安装包为 **v0.1.10**。本次完善并核对 45 个业务源码文件的中文注释，阅读与听书功能延续 v0.1.9。
 
-- [下载 v0.1.9 Android APK](https://github.com/BestJerry/FreeReading/releases/download/v0.1.9/FreeReading-v0.1.9.apk)
-- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading/releases/tag/v0.1.9)
+- [下载 v0.1.10 Android APK](https://github.com/BestJerry/FreeReading/releases/download/v0.1.10/FreeReading-v0.1.10.apk)
+- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading/releases/tag/v0.1.10)
 
 下载 APK 后，按 Android 系统提示允许该下载来源安装应用，即可安装。当前发布的是 **Debug 签名测试包**；同签名的已有测试版可覆盖安装，保留书架与进度。听书需在系统语音设置中安装对应语言的离线音色。本轮通过本地单测、构建和静态检查，未进行真机复测。
 
@@ -128,6 +128,12 @@ JAVA_HOME=/path/to/jdk17 ./gradlew -Dorg.gradle.java.home=/path/to/jdk17 :app:as
 - `docs/`：故障诊断、修复边界与验证记录。
 
 ## 验证状态
+
+0.1.10 的本地验证：
+
+- 全量 **52 个测试类、515 条测试通过**，无失败、错误或跳过；Debug APK 构建成功，Lint 无错误且警告数量未增加。本轮未操作真机。
+- 已对照实现审校 45 个业务源码文件的中文注释；Kotlin 词法核验确认相对 v0.1.9 的业务代码与字符串内容保持一致。
+- APK 版本为 0.1.10（版本码 11），签名与先前测试版一致，可覆盖安装；发布附件提供 SHA-256 校验文件。
 
 0.1.9 的本地验证：
 
