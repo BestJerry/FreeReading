@@ -18,6 +18,7 @@ import org.readium.r2.shared.publication.services.content.DefaultContentService
 import org.readium.r2.shared.publication.services.content.contentServiceFactory
 import org.readium.r2.shared.publication.services.isProtected
 import org.readium.r2.shared.publication.services.isRestricted
+import org.readium.r2.shared.publication.services.positionsByReadingOrder
 import org.readium.r2.shared.util.AbsoluteUrl
 import org.readium.r2.shared.util.asset.AssetRetriever
 import org.readium.r2.shared.util.format.Specification
@@ -34,11 +35,19 @@ class ReadiumEngine(context: Context) {
     private val retriever = AssetRetriever(context.applicationContext.contentResolver, DefaultHttpClient())
     private val opener = PublicationOpener(EpubParser())
 
-    suspend fun open(file: File, onProgress: ((Long, Long?) -> Unit)? = null): Publication {
+    suspend fun open(file: File, onProgress: ((Long, Long?) -> Unit)? = null): Publication =
+        openValidated(file, onProgress, reading = false)
+
+    /** Opens an already imported private book without repeating its whole-text import check. */
+    internal suspend fun openForReading(file: File): Publication =
+        openValidated(file, onProgress = null, reading = true)
+
+    private suspend fun openValidated(file: File, onProgress: ((Long, Long?) -> Unit)?,
+                                      reading: Boolean): Publication {
         var pending: Publication? = null
         try {
             return withContext(Dispatchers.IO) {
-                openLocal(file, onProgress).also { pending = it }
+                openLocal(file, onProgress, reading).also { pending = it }
             }
         } catch (error: Throwable) {
             // Cancellation during the dispatcher handoff can discard a successfully opened value.
@@ -48,7 +57,8 @@ class ReadiumEngine(context: Context) {
     }
 
     @OptIn(ExperimentalReadiumApi::class)
-    private suspend fun openLocal(file: File, onProgress: ((Long, Long?) -> Unit)?): Publication {
+    private suspend fun openLocal(file: File, onProgress: ((Long, Long?) -> Unit)?,
+                                  reading: Boolean): Publication {
         onProgress?.invoke(0, null)
         validateArchive(file)
         currentCoroutineContext().ensureActive()
@@ -71,7 +81,12 @@ class ReadiumEngine(context: Context) {
             throw error
         }
         try {
-            validatePublication(publication, onProgress)
+            validatePublication(publication, onProgress, readAllChapters = !reading)
+            if (reading) {
+                // Readium's Fragment constructor calls runBlocking on this service. Populate its
+                // existing cache here on IO, with the same position/progression algorithm.
+                publication.positionsByReadingOrder()
+            }
             currentCoroutineContext().ensureActive()
             // Publication retains the asset's container until Publication.close().
             return publication
@@ -81,7 +96,8 @@ class ReadiumEngine(context: Context) {
         }
     }
 
-    private suspend fun validatePublication(publication: Publication, onProgress: ((Long, Long?) -> Unit)?) {
+    private suspend fun validatePublication(publication: Publication, onProgress: ((Long, Long?) -> Unit)?,
+                                            readAllChapters: Boolean) {
         if (publication.isProtected || publication.isRestricted) {
             throw BookImportException("暂不支持有 DRM 保护的 EPUB，请导入无 DRM 的书籍")
         }
@@ -107,6 +123,7 @@ class ReadiumEngine(context: Context) {
         if (publication.readingOrder.any { it.url() is AbsoluteUrl }) {
             throw BookImportException("这本 EPUB 的正文依赖外部资源，暂不支持导入")
         }
+        if (!readAllChapters) return
         // Readium's content iterator logs unreadable chapters and skips them. Check them here so
         // a damaged archive cannot silently import an incomplete speech index.
         val total = publication.readingOrder.size.toLong()

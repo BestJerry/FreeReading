@@ -4,6 +4,9 @@ import com.freereading.epub.withoutLeadingHtmlBom
 import java.util.IdentityHashMap
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import org.jsoup.nodes.TextNode
+import org.jsoup.select.NodeFilter
+import org.jsoup.select.NodeTraversor
 import org.jsoup.select.Selector
 
 internal sealed interface SourceSpeechAnchor {
@@ -20,6 +23,52 @@ internal class SourceSentenceResolver(html: String) {
         elements.forEachIndexed { index, element -> put(element, index) }
     }
     private val selectors = HashMap<String, Element?>()
+
+    /** Finds the last TOC boundary before a visible element, within this resource only. */
+    @Synchronized
+    fun resolveContents(entries: List<Pair<Int, String?>>, anchor: SourceSpeechAnchor): Int? {
+        val resourceStart = entries.lastOrNull { it.second == null }?.first
+        if (anchor == SourceSpeechAnchor.ResourceStart) return resourceStart
+        val target = when (anchor) {
+            is SourceSpeechAnchor.Element -> uniqueElement(anchor.selector)
+            is SourceSpeechAnchor.Fragment -> elements.filter { it.id() == anchor.id }.singleOrNull()
+            SourceSpeechAnchor.ResourceStart -> null
+        } ?: return null
+        // A whole-document selector does not identify the currently visible chapter.
+        if (target.normalName() in setOf("html", "body")) return null
+        val targetOrder = documentOrder[target] ?: return null
+        val visibleStartOrder = if (anchor is SourceSpeechAnchor.Element) {
+            contentsTextStartOrder(target, targetOrder)
+        } else targetOrder
+        val wanted = entries.mapNotNull { it.second }.toHashSet()
+        val boundaries = HashMap<String, Element?>()
+        for (element in elements) {
+            val id = element.id()
+            if (id in wanted) boundaries[id] = if (boundaries.containsKey(id)) null else element
+        }
+        return entries.mapNotNull { (index, fragment) ->
+            val element = fragment?.let(boundaries::get) ?: return@mapNotNull null
+            val order = documentOrder[element] ?: return@mapNotNull null
+            (index to order).takeIf { order <= visibleStartOrder }
+        }.maxWithOrNull(compareBy<Pair<Int, Int>> { it.second }.thenBy { it.first })?.first ?: resourceStart
+    }
+
+    /** Empty inline anchors before a heading's first text belong to that visible heading. */
+    private fun contentsTextStartOrder(target: Element, targetOrder: Int): Int {
+        var leadingOrder = targetOrder
+        var hasText = false
+        NodeTraversor.filter(NodeFilter { node, _ ->
+            if (node is TextNode && node.wholeText.isNotBlank()) {
+                hasText = true
+                NodeFilter.FilterResult.STOP
+            } else {
+                if (node is Element) documentOrder[node]?.let { leadingOrder = it }
+                NodeFilter.FilterResult.CONTINUE
+            }
+        }, target)
+        // A textless container does not prove that its later descendants are already visible.
+        return if (hasText) leadingOrder else targetOrder
+    }
 
     @Synchronized
     fun resolve(candidates: List<SentenceLocatorMatcher.Anchor>, anchor: SourceSpeechAnchor): Int? {

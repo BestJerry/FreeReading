@@ -51,6 +51,8 @@ object PlaybackHub {
     private val playbackSessionSequence = AtomicLong()
     private val mutableState = MutableStateFlow(PlaybackSnapshot())
     val state: StateFlow<PlaybackSnapshot> = mutableState.asStateFlow()
+    private val mutableVoiceState = MutableStateFlow(TtsVoiceUiState())
+    internal val voiceState: StateFlow<TtsVoiceUiState> = mutableVoiceState.asStateFlow()
     @Volatile internal var serviceAlive = false
 
     /** Pass index = -1 to restore the persisted sentence and within-sentence position. */
@@ -111,6 +113,31 @@ object PlaybackHub {
     fun previous(context: Context) = send(context, ReadingAudioService.ACTION_PREVIOUS)
     fun stop(context: Context) = send(context, ReadingAudioService.ACTION_STOP)
 
+    internal fun loadVoices(context: Context, bookId: String, language: String) =
+        sendVoiceRequest(context, bookId, language, switching = false)
+
+    internal fun selectVoice(context: Context, bookId: String, language: String, voiceId: String?) =
+        sendVoiceRequest(context, bookId, language, switching = true, voiceId = voiceId)
+
+    private fun sendVoiceRequest(context: Context, bookId: String, language: String,
+                                 switching: Boolean, voiceId: String? = null) {
+        val requestId = UUID.randomUUID().toString()
+        val old = voiceState.value
+        publishVoices(TtsVoiceUiState(bookId = bookId, language = language, requestId = requestId,
+            loading = !switching, switching = switching,
+            catalog = old.catalog.takeIf { old.bookId == bookId && old.language == language }))
+        val action = if (switching) ReadingAudioService.ACTION_SELECT_VOICE else ReadingAudioService.ACTION_LOAD_VOICES
+        val intent = command(context, action).putExtra(ReadingAudioService.EXTRA_BOOK_ID, bookId)
+            .putExtra(ReadingAudioService.EXTRA_LANGUAGE, language)
+            .putExtra(ReadingAudioService.EXTRA_VOICE_REQUEST_ID, requestId)
+            .putExtra(ReadingAudioService.EXTRA_VOICE_ID, voiceId)
+        try { context.applicationContext.startService(intent) }
+        catch (_: RuntimeException) {
+            if (voiceState.value.requestId == requestId) publishVoices(voiceState.value.copy(
+                loading = false, switching = false, error = context.getString(R.string.audio_start_failed)))
+        }
+    }
+
     fun openVoiceSettings(context: Context) {
         val candidates = listOf(Intent("com.android.settings.TTS_SETTINGS"),
             Intent(Settings.ACTION_SETTINGS))
@@ -123,6 +150,7 @@ object PlaybackHub {
     }
 
     internal fun publish(snapshot: PlaybackSnapshot) { mutableState.value = snapshot }
+    internal fun publishVoices(snapshot: TtsVoiceUiState) { mutableVoiceState.value = snapshot }
     internal fun savedSpeed(context: Context): Float {
         val speed = context.getSharedPreferences("playback_settings", Context.MODE_PRIVATE).getFloat("speed", 1f)
         return if (speed.isFinite()) speed.coerceIn(0.5f, 2f) else 1f

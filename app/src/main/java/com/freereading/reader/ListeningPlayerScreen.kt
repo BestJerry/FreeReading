@@ -74,6 +74,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.freereading.audio.PlaybackSnapshot
+import com.freereading.audio.TtsVoiceUiState
 import com.freereading.audio.chapterProgressFraction
 import java.io.File
 import java.util.Locale
@@ -102,17 +103,27 @@ internal fun ListeningPlayerScreen(
     onLocate: () -> Unit,
     onStop: () -> Unit,
     onVoiceSettings: () -> Unit,
+    voiceState: TtsVoiceUiState,
+    onLoadVoices: () -> Unit,
+    onSelectVoice: (String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val muted = ink.copy(alpha = 0.62f)
     val controlsEnabled = activeBook
     val readingActionsEnabled = enabled && activeBook
+    val anotherBookHasAudio = !activeBook && snapshot.bookId != null
+    val voiceEnabled = (enabled || activeBook) && !anotherBookHasAudio
     val title = bookTitle.ifBlank { if (activeBook) snapshot.bookTitle else "未命名书籍" }.ifBlank { "未命名书籍" }
     val fraction = if (activeBook) snapshot.chapterProgressFraction else 0f
     val progressLabel = if (activeBook && snapshot.chapterSentenceCount > 0) "${(fraction * 100).toInt()}%" else "—"
     val playing = activeBook && snapshot.isPlaying
     val preparing = activeBook && snapshot.isPreparing
     var speedMenu by remember { mutableStateOf(false) }
+    var voicePicker by remember { mutableStateOf(false) }
+    val voiceSummary = voiceState.catalog?.let { catalog ->
+        if (catalog.selectedVoiceId == null) "自动选择"
+        else catalog.voices.firstOrNull { it.id == catalog.selectedVoiceId }?.name ?: "选择音色"
+    } ?: "选择音色"
     MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(
         primary = accent, onPrimary = paper,
         background = paper, onBackground = ink,
@@ -186,17 +197,38 @@ internal fun ListeningPlayerScreen(
                         }
                         ListeningSeekButton(Icons.Default.FastForward, "快进15秒", controlsEnabled, ink) { onSeek(15_000L) }
                     }
-                    Box {
-                        TextButton(onClick = { speedMenu = true }, enabled = controlsEnabled,
-                            modifier = Modifier.semantics { contentDescription = "播放速度" }) {
-                            Text("${listeningSpeedLabel(snapshot.speed)} 倍速", fontSize = 13.sp)
-                        }
-                        DropdownMenu(expanded = speedMenu && controlsEnabled, onDismissRequest = { speedMenu = false }) {
-                            listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f).forEach { speed ->
-                                DropdownMenuItem(text = { Text(listeningSpeedLabel(speed), color = ink) },
-                                    onClick = { speedMenu = false; onSpeed(speed) })
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.weight(0.35f)) {
+                            TextButton(onClick = { speedMenu = true }, enabled = controlsEnabled,
+                                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "播放速度" }) {
+                                Text("${listeningSpeedLabel(snapshot.speed)} 倍速", fontSize = 13.sp,
+                                    textAlign = TextAlign.Center)
+                            }
+                            DropdownMenu(expanded = speedMenu && controlsEnabled, onDismissRequest = { speedMenu = false }) {
+                                listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f).forEach { speed ->
+                                    DropdownMenuItem(text = { Text(listeningSpeedLabel(speed), color = ink) },
+                                        onClick = { speedMenu = false; onSpeed(speed) })
+                                }
                             }
                         }
+                        TextButton(onClick = { onLoadVoices(); voicePicker = true }, enabled = voiceEnabled,
+                            modifier = Modifier.weight(0.65f).testTag("listening-voice-picker").semantics {
+                                contentDescription = "选择朗读音色"
+                                stateDescription = if (anotherBookHasAudio) "开始本书听书后可选择音色" else voiceSummary
+                            }) {
+                            Text("音色 · $voiceSummary", fontSize = 13.sp, maxLines = 2,
+                                overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+                        }
+                    }
+                    if (anotherBookHasAudio) {
+                        Text("开始本书听书后可选择音色", color = muted, fontSize = 11.sp,
+                            textAlign = TextAlign.Center)
+                    }
+                    if (voicePicker) {
+                        TtsVoicePicker(state = voiceState, paper = paper, ink = ink, accent = accent,
+                            onDismiss = { voicePicker = false }, onRetry = onLoadVoices,
+                            onSelect = onSelectVoice, onVoiceSettings = onVoiceSettings)
                     }
                     Spacer(Modifier.height(18.dp))
                     Surface(color = ink.copy(alpha = 0.035f), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {

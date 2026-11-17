@@ -138,6 +138,34 @@ class ReaderResumePolicyTest {
             ReadingPlaybackIntent.CONTINUE_AUDIO)
     }
 
+    @Test fun metadataOpeningKeepsThePreciseSavedVisualPageWithoutAFullIndex() {
+        assertSame(persisted, resolveReadingResumeProgress(book.book, persisted, null, null,
+            ReadingPlaybackIntent.CONTINUE_AUDIO, cachedBook = null))
+    }
+
+    @Test fun metadataOpeningRetainsAnUnresolvedStopUntilItsIndexArrives() {
+        val stopped = ReadingProgress(book.book.id, sentenceIndex = Int.MAX_VALUE, audioOffsetMs = 6_000)
+        val pending = resolveReadingResumeProgress(book.book, persisted, stopped, book.book.id,
+            ReadingPlaybackIntent.CONTINUE_AUDIO, cachedBook = null)!!
+
+        assertEquals(2, pending.sentenceIndex)
+        assertEquals(6_000L, pending.audioOffsetMs)
+        assertNull(pending.locatorJson)
+        val resolved = resolveReadingResumeProgress(book.book, persisted, pending, null,
+            ReadingPlaybackIntent.CONTINUE_AUDIO, cachedBook = book)!!
+        assertEquals("locator-2", resolved.locatorJson)
+        assertEquals(6_000L, resolved.audioOffsetMs)
+    }
+
+    @Test fun metadataOpeningHonorsManualReadingAndTheActiveAudioOwner() {
+        assertNull(resolveReadingResumeProgress(book.book, persisted, persisted, null,
+            ReadingPlaybackIntent.FROM_READING_LOCATION, cachedBook = null))
+        assertNull(resolveReadingResumeProgress(book.book, persisted, null, book.book.id,
+            ReadingPlaybackIntent.CONTINUE_AUDIO, cachedBook = null))
+        assertSame(persisted, resolveReadingResumeProgress(book.book, persisted,
+            persisted.copy(bookId = "other"), null, ReadingPlaybackIntent.CONTINUE_AUDIO, cachedBook = null))
+    }
+
     private fun resolve(
         stopped: ReadingProgress? = null,
         activeBookId: String? = null,

@@ -6,6 +6,7 @@ import android.net.Uri
 import android.graphics.PointF
 import android.os.Looper
 import android.view.ViewConfiguration
+import androidx.compose.runtime.MutableState
 import com.freereading.ReadingApplication
 import com.freereading.audio.PlaybackHub
 import com.freereading.audio.PlaybackSnapshot
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -98,6 +100,75 @@ class ReaderHighlightLifecycleTest {
         PlaybackHub.publish(PlaybackSnapshot())
         shadowOf(Looper.getMainLooper()).idle()
         if (::app.isInitialized) File(app.filesDir, "books").deleteRecursively()
+    }
+
+    @Test fun openingContentsUsesTheLatestNavigatorPageInsteadOfTheDebouncedOrAudioCursor() {
+        val pages = chapterPages()
+        val latest = pages[1]
+        val stale = pages[0]
+        val jumps = recordNavigation()
+        setNavigatorPage(latest)
+        setDisplayedPage(stale)
+        PlaybackHub.publish(snapshot(1))
+        shadowOf(app).clearStartedServices()
+
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "openContents")
+
+        assertTrue(ReflectionHelpers.callInstanceMethod(activity, "getShowContents"))
+        assertEquals(1, selectedContentsIndex())
+        assertEquals(3, contentsEntries().size)
+        assertEquals(latest.href.removeFragment(), contentsEntries()[1].link.url().removeFragment())
+        assertEquals(latest, fragment.currentLocator.value)
+        assertTrue(jumps.isEmpty())
+        assertNull(shadowOf(app).nextStartedService)
+        assertFalse(following())
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "dismissContents")
+    }
+
+    @Test fun reopeningContentsTakesANewNavigatorSnapshotInsteadOfItsPreviousChapter() {
+        val pages = chapterPages()
+        val jumps = recordNavigation()
+        setNavigatorPage(pages[0])
+        setDisplayedPage(pages[2])
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "openContents")
+        assertEquals(0, selectedContentsIndex())
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "dismissContents")
+        assertFalse(ReflectionHelpers.callInstanceMethod(activity, "getShowContents"))
+
+        setNavigatorPage(pages[2])
+        setDisplayedPage(pages[0])
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "openContents")
+
+        assertEquals(2, selectedContentsIndex())
+        assertEquals(pages[2].href.removeFragment(), contentsEntries()[2].link.url().removeFragment())
+        assertTrue(jumps.isEmpty())
+        assertFalse(activity.isFinishing)
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "dismissContents")
+    }
+
+    @Test fun openingAndDismissingContentsPreservesFollowingWithoutTransportOrNavigation() {
+        val jumps = recordNavigation()
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "followCurrentAudio")
+        pageListener().onPageLoaded()
+        await("initial followed audio page") { jumps.isNotEmpty() }
+        jumps.clear()
+        val latest = chapterPages()[1]
+        setNavigatorPage(latest)
+        setDisplayedPage(chapterPages()[0])
+        val audio = PlaybackHub.state.value
+        shadowOf(app).clearStartedServices()
+        assertTrue(following())
+
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "openContents")
+        assertEquals(1, selectedContentsIndex())
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "dismissContents")
+
+        assertTrue(following())
+        assertEquals(audio, PlaybackHub.state.value)
+        assertEquals(latest, fragment.currentLocator.value)
+        assertTrue(jumps.isEmpty())
+        assertNull(shadowOf(app).nextStartedService)
+        assertFalse(activity.isFinishing)
     }
 
     @Test fun firstPageReadyBindsTheCurrentSentenceAndSameSentenceReloadForcesAFreshDecoration() {
@@ -392,6 +463,26 @@ class ReaderHighlightLifecycleTest {
     }
 
     private fun locator(index: Int): Locator = requireNotNull(Locator.fromJSON(JSONObject(book.sentences[index].locatorJson)))
+    private fun chapterPages(): List<Locator> = book.sentences.distinctBy { it.chapterIndex }
+        .map { locator(it.index) }.also { assertEquals(3, it.size) }
+
+    private fun setNavigatorPage(page: Locator) {
+        // Readium 3.1.2 exposes this exact MutableStateFlow through currentLocator.
+        val current: MutableStateFlow<Locator> = ReflectionHelpers.getField(fragment, "_currentLocator")
+        current.value = page
+    }
+
+    private fun setDisplayedPage(page: Locator) {
+        val displayed: MutableState<Locator?> = ReflectionHelpers.getField(activity, "visibleLocator\$delegate")
+        displayed.value = page
+    }
+
+    private fun selectedContentsIndex(): Int? =
+        ReflectionHelpers.callInstanceMethod(activity, "getSelectedContentsIndex")
+
+    private fun contentsEntries(): List<ContentsEntry> =
+        ReflectionHelpers.callInstanceMethod(activity, "getContentsEntries")
+
     private fun following(): Boolean = ReflectionHelpers.callInstanceMethod(activity, "getFollowingAudio")
     private fun pendingRequestId(): String = requireNotNull(ReflectionHelpers.getField<String?>(activity, "pendingAudioRequestId"))
 

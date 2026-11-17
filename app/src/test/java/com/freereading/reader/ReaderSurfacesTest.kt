@@ -14,10 +14,14 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.freereading.audio.PlaybackSnapshot
+import com.freereading.audio.TtsVoiceCatalog
+import com.freereading.audio.TtsVoiceOption
+import com.freereading.audio.TtsVoiceUiState
 import com.freereading.ui.Forest
 import com.freereading.ui.FreeReadingTheme
 import com.freereading.ui.Ink
 import com.freereading.ui.Paper
+import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -246,12 +250,66 @@ class ReaderSurfacesTest {
         compose.onNodeWithText("第七章 山间").assertDoesNotExist()
         compose.onNodeWithContentDescription("章节播放进度").performScrollTo()
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "—"))
-        listOf("快退15秒", "快进15秒", "播放速度", "跟随原文", "定位正在朗读的原文", "结束听书")
+        listOf("快退15秒", "快进15秒", "播放速度", "跟随原文", "定位正在朗读的原文", "结束听书", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertIsNotEnabled() }
         clickListening("开始或继续听书")
         clickListening("从阅读位置开始听书")
 
         compose.runOnIdle { assertEquals(listOf("toggle", "from-reading"), events) }
+    }
+
+    @Test fun voiceChoicesAreAvailableBeforePlaybackAndRefreshEveryTimeTheyOpen() {
+        val events = showListening(activeBook = false, snapshot = sampleSnapshot().copy(bookId = null))
+
+        compose.onNodeWithContentDescription("选择朗读音色").performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "选择音色"))
+        compose.onNodeWithText("音色 · 自动选择").assertDoesNotExist()
+        clickListening("选择朗读音色")
+        compose.onNodeWithTag("tts-voice-dialog").assertIsDisplayed()
+        compose.onNodeWithTag("tts-voice-done").performClick()
+        clickListening("选择朗读音色")
+        compose.onNodeWithTag("tts-voice-done").performClick()
+
+        compose.runOnIdle { assertEquals(listOf("load-voices", "load-voices"), events) }
+    }
+
+    @Test fun anotherBooksSessionPreventsChangingItsVoicesFromThisBook() {
+        val events = showListening(activeBook = false, snapshot = sampleSnapshot().copy(isPlaying = false))
+
+        compose.onNodeWithContentDescription("选择朗读音色").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("开始本书听书后可选择音色").assertIsDisplayed()
+        compose.onNodeWithTag("tts-voice-dialog").assertDoesNotExist()
+
+        compose.runOnIdle { assertEquals(emptyList<String>(), events) }
+    }
+
+    @Test fun activeAudioKeepsVoiceChoicesAvailableWhileReaderLoads() {
+        val events = showListening(enabled = false)
+
+        clickListening("选择朗读音色")
+        compose.onNodeWithTag("tts-voice-dialog").assertIsDisplayed()
+        compose.onNodeWithTag("tts-voice-done").performClick()
+
+        compose.runOnIdle { assertEquals(listOf("load-voices"), events) }
+    }
+
+    @Test fun voiceEntryDisplaysTheConfirmedEngineName() {
+        val voice = TtsVoiceOption("chosen", "zh-CN-installed-local", Locale.SIMPLIFIED_CHINESE, 400)
+        showListening(voiceState = TtsVoiceUiState(catalog = TtsVoiceCatalog("system.engine",
+            listOf(voice), selectedVoiceId = voice.id, effectiveVoiceId = voice.id)))
+
+        compose.onNodeWithContentDescription("选择朗读音色").performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, voice.name))
+        compose.onNodeWithText("音色 · ${voice.name}").assertIsDisplayed()
+    }
+
+    @Test fun voiceEntryOnlyClaimsAutomaticSelectionAfterLoadingTheCatalog() {
+        showListening(voiceState = TtsVoiceUiState(catalog = TtsVoiceCatalog("system.engine",
+            emptyList(), selectedVoiceId = null, effectiveVoiceId = null)))
+
+        compose.onNodeWithContentDescription("选择朗读音色").performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "自动选择"))
+        compose.onNodeWithText("音色 · 自动选择").assertIsDisplayed()
     }
 
     @Test fun activeAudioRemainsControllableWhileReaderLoads() {
@@ -280,7 +338,7 @@ class ReaderSurfacesTest {
             snapshot = sampleSnapshot().copy(error = "其他书的离线语音错误", needsVoiceData = true))
 
         listOf("开始或继续听书", "快退15秒", "快进15秒", "播放速度", "跟随原文",
-            "定位正在朗读的原文", "从阅读位置开始听书", "结束听书")
+            "定位正在朗读的原文", "从阅读位置开始听书", "结束听书", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertIsNotEnabled() }
         compose.onNodeWithContentDescription("安装或设置离线语音").assertDoesNotExist()
         compose.onNodeWithContentDescription("返回阅读").assertIsEnabled().performClick()
@@ -326,7 +384,7 @@ class ReaderSurfacesTest {
 
     private fun assertNoFullPlayerControls() {
         listOf("暂停听书", "开始或继续听书", "快退15秒", "快进15秒", "播放速度",
-            "结束听书", "从阅读位置开始听书", "定位正在朗读的原文")
+            "结束听书", "从阅读位置开始听书", "定位正在朗读的原文", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertDoesNotExist() }
         compose.onNodeWithTag("listening-screen").assertDoesNotExist()
     }
@@ -369,6 +427,7 @@ class ReaderSurfacesTest {
         snapshot: PlaybackSnapshot = sampleSnapshot(),
         activeBook: Boolean = true,
         enabled: Boolean = true,
+        voiceState: TtsVoiceUiState = TtsVoiceUiState(),
     ): MutableList<String> {
         val events = mutableListOf<String>()
         compose.setContent {
@@ -380,7 +439,8 @@ class ReaderSurfacesTest {
                     onSeek = { events += "seek:$it" }, onSpeed = { events += "speed:$it" },
                     onFromReading = { events += "from-reading" }, onFollowToggle = { events += "follow" },
                     onLocate = { events += "locate" }, onStop = { events += "stop" },
-                    onVoiceSettings = { events += "voice-settings" })
+                    onVoiceSettings = { events += "voice-settings" }, voiceState = voiceState,
+                    onLoadVoices = { events += "load-voices" }, onSelectVoice = { events += "voice:$it" })
             }
         }
         return events

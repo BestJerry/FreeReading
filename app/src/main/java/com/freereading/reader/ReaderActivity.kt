@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.ActionMode
 import android.view.Menu
 import android.view.MenuItem
@@ -25,8 +26,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Remove
@@ -67,16 +66,21 @@ import androidx.lifecycle.withStateAtLeast
 import com.freereading.ReadingApplication
 import com.freereading.audio.PlaybackHub
 import com.freereading.audio.PlaybackSnapshot
+import com.freereading.audio.TtsVoiceUiState
+import com.freereading.data.BookRecord
 import com.freereading.data.ReadingProgress
 import com.freereading.data.SpeechBook
 import com.freereading.data.SpeechSentence
 import com.freereading.ui.FreeReadingTheme
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -117,10 +121,18 @@ class ReaderActivity : FragmentActivity() {
     private var publication: Publication? = null
     private var navigator: EpubNavigatorFragment? = null
     private var speechBook by mutableStateOf<SpeechBook?>(null)
+    private var readingRecord by mutableStateOf<BookRecord?>(null)
+    private var speechLoad: Deferred<SpeechBook>? = null
+    private var speechGeneration = 0L
+    private var lateInitialStopRevision: Long? = null
     private var visibleLocator by mutableStateOf<Locator?>(null)
     private var loading by mutableStateOf(true)
     private var openingError by mutableStateOf<String?>(null)
     private var showContents by mutableStateOf(false)
+    private var contentsEntries by mutableStateOf<List<ContentsEntry>>(emptyList())
+    private var selectedContentsIndex by mutableStateOf<Int?>(null)
+    private var contentsJob: Job? = null
+    private var contentsGeneration = 0L
     private var showAppearance by mutableStateOf(false)
     private var showReadingControls by mutableStateOf(false)
     private var showListening by mutableStateOf(false)
@@ -230,6 +242,11 @@ class ReaderActivity : FragmentActivity() {
 
     private fun openBook() {
         loadJob?.cancel()
+        speechGeneration += 1
+        speechLoad?.cancel()
+        speechLoad = null
+        speechBook = null
+        readingRecord = null
         loading = true
         openingError = null
         openingOverlay.visibility = View.VISIBLE
@@ -238,13 +255,13 @@ class ReaderActivity : FragmentActivity() {
             var installed = false
             try {
                 require(bookId.isNotEmpty()) { "未找到书籍，请返回书架重新打开。" }
-                val book = repository.loadSpeechBook(bookId)
-                val saved = withContext(Dispatchers.IO) { repository.progress(bookId) }
+                val prepared = repository.prepareReadingBook(bookId)
                 val readyPublication = withContext(Dispatchers.IO) {
-                    repository.readium.open(repository.bookFile(bookId)).also { opened = it }
+                    repository.readium.openForReading(repository.bookFile(bookId)).also { opened = it }
                 }
                 lifecycle.withStateAtLeast(Lifecycle.State.STARTED) {
-                    installNavigator(readyPublication, book, saved)
+                    installReadingNavigator(readyPublication, prepared.record, prepared.progress,
+                        prepared.cachedSpeechBook)
                     installed = true
                 }
             } catch (cancelled: CancellationException) {
@@ -259,30 +276,47 @@ class ReaderActivity : FragmentActivity() {
     }
 
     private fun installNavigator(opened: Publication, book: SpeechBook, saved: ReadingProgress) {
+        installReadingNavigator(opened, book.book, saved, book)
+    }
+
+    private fun installReadingNavigator(opened: Publication, record: BookRecord, saved: ReadingProgress,
+                                        cachedBook: SpeechBook?) {
         audioBinding?.cancel()
         audioHighlighter = null
         audioPageReady = false
-        speechBook = book
-        pendingAudioSentence = pendingAudioSentence?.takeIf { it in book.sentences.indices }
+        speechGeneration += 1
+        speechLoad?.cancel()
+        speechLoad = null
+        speechBook = cachedBook
+        readingRecord = record
+        lastAnchorChapter = null
+        chapterAnchors = emptyList()
+        pendingAudioSentence = pendingAudioSentence?.takeIf { it in 0 until record.sentenceCount }
         if (pendingAudioSentence == null) pendingAudioRequestId = null
         publication = opened
         readingOrderHrefs = opened.readingOrder.map { it.url().removeFragment().toString() }
         val audio = PlaybackHub.state.value
         acknowledgeAudioStart(audio)
-        resumableProgress = resolveResumeProgress(book, saved, pendingStoppedProgress,
-            audio.bookId, readingPlaybackIntent)
+        resumableProgress = resolveReadingResumeProgress(record, saved, pendingStoppedProgress,
+            audio.bookId, readingPlaybackIntent, cachedBook)
         val stoppedLocator = resumableProgress?.takeIf { pendingStoppedProgress != null }?.locatorJson
-        val pendingAudioLocator = pendingAudioSentence?.let { book.sentences[it].locatorJson }
+        val pendingAudioLocator = pendingAudioSentence?.let { cachedBook?.sentences?.getOrNull(it)?.locatorJson }
         val initial = when {
             readingPlaybackIntent == ReadingPlaybackIntent.RETRY_AUDIO_START && stoppedLocator != null ->
                 restoredLocator ?: stoppedLocator
             followingAudio && pendingAudioLocator != null -> pendingAudioLocator
             followingAudio && stoppedLocator != null -> stoppedLocator
-            followingAudio && audio.bookId == bookId -> book.sentences.getOrNull(audio.sentenceIndex)?.locatorJson
+            followingAudio && audio.bookId == bookId ->
+                cachedBook?.sentences?.getOrNull(audio.sentenceIndex)?.locatorJson ?: restoredLocator ?: saved.locatorJson
             restoredLocator != null -> restoredLocator
             else -> saved.locatorJson
         }?.let(::parseLocator)
+        lateInitialStopRevision = readingNavigationRevision.takeIf {
+            cachedBook == null && pendingStoppedProgress?.bookId == bookId && stoppedLocator == null &&
+                followingAudio && (readingPlaybackIntent != ReadingPlaybackIntent.RETRY_AUDIO_START || restoredLocator == null)
+        }
         visibleLocator = initial
+        if (cachedBook == null) speechLoader()
         var installedFragment: EpubNavigatorFragment? = null
         val factory = EpubNavigatorFactory(opened).createFragmentFactory(
             initialLocator = initial,
@@ -321,6 +355,8 @@ class ReaderActivity : FragmentActivity() {
                     // Readium can cache a decoration while dropping its script before isLoaded.
                     // A new render generation forces a real DOM update once the page is ready.
                     audioHighlighter?.onPageLoaded()
+                    // Index decoding is deliberately outside the path to the first readable page.
+                    if (speechBook == null && speechLoad?.isCancelled != true) speechLoader().start()
                 }
             },
             configuration = EpubNavigatorFragment.Configuration(
@@ -363,6 +399,61 @@ class ReaderActivity : FragmentActivity() {
         loading = false
         openingOverlay.visibility = View.GONE
         observeLocator(fragment)
+    }
+
+    private fun speechLoader(): Deferred<SpeechBook> {
+        speechLoad?.takeUnless { it.isCancelled }?.let { return it }
+        val token = speechGeneration
+        val expectedAddedAt = readingRecord?.addedAt
+        return lifecycleScope.async(start = CoroutineStart.LAZY) {
+            repository.loadSpeechBook(bookId).also { loaded ->
+                check(expectedAddedAt == null || loaded.book.addedAt == expectedAddedAt) {
+                    "书籍已重新导入，请返回书架重新打开。"
+                }
+                if (speechGeneration == token) attachSpeechBook(loaded)
+            }
+        }.also { speechLoad = it }
+    }
+
+    private suspend fun awaitSpeechBook(): SpeechBook = speechBook ?: speechLoader().await()
+
+    /** Completes listening capabilities without replacing the already visible reader. */
+    private fun attachSpeechBook(book: SpeechBook) {
+        if (book.book.id != bookId || readingRecord?.let { it.addedAt != book.book.addedAt } == true) return
+        speechBook = book
+        readingRecord = book.book
+        lastAnchorChapter = null
+        chapterAnchors = emptyList()
+        pendingAudioSentence = pendingAudioSentence?.takeIf { it in book.sentences.indices }
+        if (pendingAudioSentence == null) pendingAudioRequestId = null
+        val stopped = pendingStoppedProgress
+        if (stopped?.bookId == bookId && readingPlaybackIntent != ReadingPlaybackIntent.FROM_READING_LOCATION) {
+            val normalized = resolveResumeProgress(book, ReadingProgress(bookId), stopped,
+                PlaybackHub.state.value.bookId, readingPlaybackIntent)
+            pendingStoppedProgress = normalized
+            if (resumableProgress != null) resumableProgress = normalized
+            if (lateInitialStopRevision == readingNavigationRevision && followingAudio) {
+                normalized?.locatorJson?.let(::parseLocator)?.let { navigator?.go(it, animated = false) }
+            }
+        }
+        lateInitialStopRevision = null
+        synchronizeAudio()
+        val snapshot = visibleTextSnapshot
+        val fragment = navigator
+        if (snapshot != null && fragment != null && snapshot.revision == readingNavigationRevision &&
+            snapshot.page == fragment.currentLocator.value && canSaveReadingLocation()) {
+            lifecycleScope.launch {
+                try {
+                    // The DOM anchor was captured during loading; the cursor need not change
+                    // again before it can now be mapped to the completed listening index.
+                    saveReadingLocation(fragment, snapshot.page)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    Log.w("FreeReadingReader", "Could not save the reading position", failure)
+                }
+            }
+        }
     }
 
     @OptIn(FlowPreview::class)
@@ -443,15 +534,69 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
-    private suspend fun saveReadingLocation(fragment: EpubNavigatorFragment, page: Locator) {
+    private suspend fun saveReadingLocation(fragment: EpubNavigatorFragment, page: Locator,
+                                           finalSave: Boolean = false) {
         // While this book owns the audio session, the service alone persists its canonical
         // locator + sentence offset. Browsing the page must not overwrite the listening cursor.
         if (!canSaveReadingLocation()) return
+        val expectedAddedAt = readingRecord?.addedAt ?: return
+        if (speechBook == null) {
+            // Capture the DOM evidence while the WebView is alive; index decoding can finish
+            // later, including after the Activity's own deferred load has been cancelled.
+            val revision = readingNavigationRevision
+            val capturedAt = System.currentTimeMillis()
+            val raw = freshVisibleRawAnchor(fragment, page) ?: visibleTextSnapshot?.takeIf {
+                it.page == page && it.revision == revision
+            }?.textAnchor ?: return
+            if (!finalSave || fragment.currentLocator.value != page) return
+            val chapter = readingOrderHrefs.indexOf(raw.href.removeFragment().toString())
+            if (chapter < 0) return
+            saveDeferredReadingLocation(page, raw, chapter, revision, capturedAt, expectedAddedAt)
+            return
+        }
         val textAnchor = visibleTextAnchor(fragment, page) ?: return
         if (fragment.currentLocator.value != page) return
         val progress = readingProgressAt(page, textAnchor) ?: return
         withContext(Dispatchers.IO) {
-            repository.saveProgress(progress)
+            repository.saveProgress(progress, expectedAddedAt = expectedAddedAt)
+        }
+    }
+
+    private suspend fun saveDeferredReadingLocation(page: Locator, raw: Locator, chapter: Int,
+                                                    revision: Long, capturedAt: Long, expectedAddedAt: Long) {
+        val saved = withContext(Dispatchers.IO) {
+            val book = repository.loadSpeechBook(bookId)
+            val candidates = SpeechSentenceAnchors.build(book.sentences.asSequence().filter { it.chapterIndex == chapter })
+            val direct = SentenceLocatorMatcher.find(candidates, raw.toAnchor(-1))
+            val index = direct ?: deferredSourceSentenceIndex(raw, candidates)
+            index?.let { sentenceIndex ->
+                ReadingProgress(bookId, page.toJSON().toString(), sentenceIndex, updatedAt = capturedAt)
+            }
+        } ?: return
+        if (readingNavigationRevision != revision || !canSaveReadingLocation()) return
+        withContext(Dispatchers.IO) { repository.saveProgress(saved, expectedAddedAt = expectedAddedAt) }
+    }
+
+    /** Final saves can outlive the Activity Publication, so reopen only for an unresolved DOM anchor. */
+    private suspend fun deferredSourceSentenceIndex(raw: Locator,
+                                                    candidates: List<SentenceLocatorMatcher.Anchor>): Int? {
+        val anchor = (raw.locations["cssSelector"] as? String)?.takeIf(String::isNotBlank)
+            ?.let { SourceSpeechAnchor.Element(it) }
+            ?: raw.locations.fragments.firstOrNull()?.let { SourceSpeechAnchor.Fragment(it) }
+            ?: return null
+        val href = raw.href.removeFragment()
+        return sourceResolverMutex.withLock {
+            val cached = sourceResolver?.takeIf { it.first == href.toString() }?.second
+            if (cached != null) return@withLock cached.resolve(candidates, anchor)
+            val opened = repository.readium.openForReading(repository.bookFile(bookId))
+            try {
+                val resource = opened.get(href) ?: return@withLock null
+                val html = resource.use { it.read().getOrNull()?.decodeString()?.getOrNull() }
+                    ?: return@withLock null
+                SourceSentenceResolver(html).resolve(candidates, anchor)
+            } finally {
+                opened.close()
+            }
         }
     }
 
@@ -466,11 +611,21 @@ class ReaderActivity : FragmentActivity() {
         return ReadingProgress(bookId, page.toJSON().toString(), sentence.index)
     }
 
-    private suspend fun freshVisibleTextAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
+    private suspend fun freshVisibleRawAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
         val revision = readingNavigationRevision
         val fresh = queryNavigatorLocator { fragment.firstVisibleElementLocator() }
         if (readingNavigationRevision != revision || fragment.currentLocator.value != page) return null
         if (fresh != null && fresh.href.removeFragment() == page.href.removeFragment()) {
+            visibleTextSnapshot = VisibleTextSnapshot(page, fresh, revision)
+            return fresh
+        }
+        return null
+    }
+
+    private suspend fun freshVisibleTextAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
+        val revision = readingNavigationRevision
+        val fresh = freshVisibleRawAnchor(fragment, page)
+        if (fresh != null) {
             val sentence = sentenceAt(fresh) ?: fresh.locations["cssSelector"]?.let { selector ->
                 (selector as? String)?.takeIf(String::isNotBlank)?.let {
                     resolveSourceSentence(fresh, SourceSpeechAnchor.Element(it))
@@ -618,6 +773,9 @@ class ReaderActivity : FragmentActivity() {
         readingStartJob?.cancel()
         readingStartJob = lifecycleScope.launch {
             try {
+                if (speechBook == null) toast("正在准备听书…")
+                awaitSpeechBook()
+                if (revision != readingNavigationRevision || navigator !== fragment) return@launch
                 val sentence = if (requested != null) {
                     val id = requested.locations.fragments.firstOrNull()
                     val anchor = if (id != null) SourceSpeechAnchor.Fragment(id) else SourceSpeechAnchor.ResourceStart
@@ -634,8 +792,8 @@ class ReaderActivity : FragmentActivity() {
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
-                toast("书页文字暂时无法解析，请稍后再试。")
+            } catch (failure: Exception) {
+                toast(failure.message ?: "听书暂时无法准备，请重试。")
             }
         }
     }
@@ -680,6 +838,24 @@ class ReaderActivity : FragmentActivity() {
         val saved = resumableProgress
         if (saved == null) {
             playFromReadingLocation()
+        } else if (speechBook == null && navigator != null) {
+            val revision = readingNavigationRevision
+            readingStartJob?.cancel()
+            readingStartJob = lifecycleScope.launch {
+                try {
+                    toast("正在准备听书…")
+                    awaitSpeechBook()
+                    if (revision != readingNavigationRevision || resumableProgress == null) return@launch
+                    val ready = resumableProgress ?: saved
+                    resumableProgress = null
+                    pendingStoppedProgress = null
+                    requestAudioStart(ready)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    toast(failure.message ?: "听书暂时无法准备，请重试。")
+                }
+            }
         } else {
             resumableProgress = null
             pendingStoppedProgress = null
@@ -706,7 +882,15 @@ class ReaderActivity : FragmentActivity() {
                 try {
                     val locator = queryNavigatorLocator { fragment.currentSelection()?.locator }
                         ?: visibleTextAnchor(fragment, fragment.currentLocator.value)
-                    if (revision == readingNavigationRevision && locator != null) playFromLocator(locator)
+                    if (revision == readingNavigationRevision && locator != null) {
+                        if (speechBook == null) toast("正在准备听书…")
+                        awaitSpeechBook()
+                        if (revision == readingNavigationRevision && navigator === fragment) playFromLocator(locator)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    toast(failure.message ?: "听书暂时无法准备，请重试。")
                 } finally {
                     if (fragment.isAdded && fragment.view != null) fragment.clearSelection()
                     mode.finish()
@@ -776,7 +960,18 @@ class ReaderActivity : FragmentActivity() {
             val page = fragment.currentLocator.value
             // Resolve the visible paragraph while the WebView is still available, then perform
             // the final AtomicFile write independently of the Activity's cancellation.
-            lifecycleScope.launch(NonCancellable) { saveReadingLocation(fragment, page) }
+            val saveJob = lifecycleScope.launch(NonCancellable, start = CoroutineStart.LAZY) {
+                try {
+                    saveReadingLocation(fragment, page, finalSave = true)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    // A damaged optional listening index must not crash an otherwise readable EPUB.
+                    Log.w("FreeReadingReader", "Could not save the reading position", failure)
+                }
+            }
+            readingRecord?.let { repository.registerReadingSave(bookId, it.addedAt, saveJob) }
+            saveJob.start()
         }
         super.onPause()
     }
@@ -797,8 +992,12 @@ class ReaderActivity : FragmentActivity() {
     @Composable
     private fun ReaderSurfaces() {
         val audio by PlaybackHub.state.collectAsStateWithLifecycle()
+        val voices by PlaybackHub.voiceState.collectAsStateWithLifecycle()
+        val libraryBooks by repository.books.collectAsStateWithLifecycle()
         val activeBook = audio.bookId == bookId
-        val book = speechBook?.book
+        val book = readingRecord ?: speechBook?.book
+        val voiceLanguage = book?.language
+            ?: libraryBooks.firstOrNull { it.id == bookId }?.language.orEmpty()
         val title = book?.title ?: audio.bookTitle.takeIf { activeBook && it.isNotBlank() } ?: "正在打开书籍"
         val enabled = navigator != null && !loading
         BackHandler(enabled = showReadingControls && !showListening && !showContents && !showAppearance) {
@@ -815,7 +1014,7 @@ class ReaderActivity : FragmentActivity() {
             enabled = enabled,
             paper = paper, ink = ink, accent = accent,
             onBack = ::finish,
-            onContents = { showReadingControls = false; showContents = true },
+            onContents = ::openContents,
             onAppearance = { showReadingControls = false; showAppearance = true },
             onListen = { showReadingControls = false; showListening = true },
             onToggleControls = { showReadingControls = !showReadingControls },
@@ -846,6 +1045,10 @@ class ReaderActivity : FragmentActivity() {
                     onLocate = { showListening = false; showReadingControls = false; followCurrentAudio() },
                     onStop = ::stopListening,
                     onVoiceSettings = { PlaybackHub.openVoiceSettings(this) },
+                    voiceState = voices.takeIf { it.bookId == bookId && it.language == voiceLanguage }
+                        ?: TtsVoiceUiState(),
+                    onLoadVoices = { PlaybackHub.loadVoices(this, bookId, voiceLanguage) },
+                    onSelectVoice = { PlaybackHub.selectVoice(this, bookId, voiceLanguage, it) },
                 )
             }
         }
@@ -912,38 +1115,88 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    private fun openContents() {
+        val opened = publication ?: return
+        val fragment = navigator ?: return
+        // The navigator has the latest page; the displayed locator is debounced for saving.
+        val page = fragment.currentLocator.value
+        val entries = flattenContents(opened.tableOfContents).ifEmpty {
+            opened.readingOrder.mapIndexed { index, link -> ContentsEntry(link, 0, "第 ${index + 1} 节") }
+        }
+        val candidates = entries.withIndex().filter { sameContentsResource(it.value, page) }
+        val fragments = page.locations.fragments + listOfNotNull(page.href.fragment)
+        val hasExactFragment = candidates.any { contentsFragment(it.value)?.let(fragments::contains) == true }
+        val needsElement = !hasExactFragment && candidates.size > 1 &&
+            candidates.any { contentsFragment(it.value) != null }
+        // A parent and a nested entry can share an anchor; keep the most specific alias.
+        val boundaries = candidates.groupBy { contentsFragment(it.value) }.values.map { aliases ->
+            val entry = aliases.maxBy { it.value.depth }
+            entry.index to contentsFragment(entry.value)
+        }
+        val fallback = currentContentsIndex(entries, page)
+        val token = ++contentsGeneration
+        contentsJob?.cancel()
+        contentsEntries = entries
+        selectedContentsIndex = if (needsElement) null else fallback
+        showReadingControls = false
+        showContents = true
+        if (!needsElement) return
+        contentsJob = lifecycleScope.launch {
+            val resolved = try {
+                val fresh = queryNavigatorLocator { fragment.firstVisibleElementLocator() }
+                if (fresh == null || fragment.currentLocator.value != page ||
+                    fresh.href.removeFragment().normalize() != page.href.removeFragment().normalize()) null
+                else resolveContentsAt(opened, fresh, boundaries)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            if (showContents && contentsGeneration == token && publication === opened) {
+                selectedContentsIndex = resolved ?: fallback
+            }
+        }
+    }
+
+    private suspend fun resolveContentsAt(opened: Publication, locator: Locator,
+                                         candidates: List<Pair<Int, String?>>): Int? {
+        val anchor = (locator.locations["cssSelector"] as? String)?.takeIf(String::isNotBlank)
+            ?.let { SourceSpeechAnchor.Element(it) }
+            ?: locator.locations.fragments.firstOrNull()?.let { SourceSpeechAnchor.Fragment(it) }
+            ?: return null
+        val href = locator.href.removeFragment()
+        return withContext(Dispatchers.IO) {
+            sourceResolverMutex.withLock {
+                val resolver = sourceResolver?.takeIf { it.first == href.toString() }?.second ?: run {
+                    val resource = opened.get(href) ?: return@withLock null
+                    val html = resource.use { it.read().getOrNull()?.decodeString()?.getOrNull() }
+                        ?: return@withLock null
+                    SourceSentenceResolver(html).also { sourceResolver = href.toString() to it }
+                }
+                resolver.resolveContents(candidates, anchor)
+            }
+        }
+    }
+
+    private fun dismissContents() {
+        contentsGeneration += 1
+        contentsJob?.cancel()
+        contentsJob = null
+        showContents = false
+    }
+
     @Composable
     private fun ContentsDialog() {
-        val entries = flattenContents(publication?.tableOfContents.orEmpty()).ifEmpty {
-            publication?.readingOrder.orEmpty().mapIndexed { index, link -> ContentsEntry(link, 0, "第 ${index + 1} 节") }
-        }
-        AlertDialog(
-            onDismissRequest = { showContents = false },
-            containerColor = paper,
-            title = { Text("目录", color = ink, fontFamily = FontFamily.Serif) },
-            text = {
-                LazyColumn(Modifier.fillMaxWidth().height(380.dp)) {
-                    items(entries) { entry ->
-                        TextButton(
-                            onClick = {
-                                markManualNavigation()
-                                requestedReadingStart = publication?.locatorFromLink(entry.link)
-                                navigator?.go(entry.link)
-                                showContents = false
-                            },
-                            modifier = Modifier.fillMaxWidth().padding(start = (entry.depth * 14).dp),
-                        ) {
-                            Text(
-                                entry.link.title?.takeIf(String::isNotBlank) ?: entry.fallbackTitle,
-                                color = ink,
-                                modifier = Modifier.fillMaxWidth(),
-                                fontSize = 14.sp,
-                            )
-                        }
-                    }
-                }
+        ReaderContentsDialog(
+            entries = contentsEntries, currentIndex = selectedContentsIndex,
+            paper = paper, ink = ink, accent = accent,
+            onDismiss = ::dismissContents,
+            onSelect = { entry ->
+                dismissContents()
+                markManualNavigation()
+                requestedReadingStart = publication?.locatorFromLink(entry.link)
+                navigator?.go(entry.link)
             },
-            confirmButton = { TextButton(onClick = { showContents = false }) { Text("关闭", color = accent) } },
         )
     }
 
@@ -986,12 +1239,6 @@ class ReaderActivity : FragmentActivity() {
             },
             confirmButton = { TextButton(onClick = { showAppearance = false }) { Text("完成", color = accent) } },
         )
-    }
-
-    private data class ContentsEntry(val link: Link, val depth: Int, val fallbackTitle: String)
-
-    private fun flattenContents(links: List<Link>, depth: Int = 0): List<ContentsEntry> = links.flatMapIndexed { index, link ->
-        listOf(ContentsEntry(link, depth, "第 ${index + 1} 节")) + flattenContents(link.children, depth + 1)
     }
 
     private fun parseLocator(json: String): Locator? = runCatching { Locator.fromJSON(JSONObject(json)) }.getOrNull()

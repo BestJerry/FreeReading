@@ -1,6 +1,7 @@
 package com.freereading.reader
 
 import com.freereading.audio.PlaybackSnapshot
+import com.freereading.data.BookRecord
 import com.freereading.data.ReadingProgress
 import com.freereading.data.SpeechBook
 import com.freereading.data.SpeechSentence
@@ -42,4 +43,24 @@ internal fun resolveResumeProgress(
     if (activeAudioBookId == bookId) return null
     // Keep a persisted visual locator intact; it can restore a more precise reading page.
     return persisted.takeIf { it.bookId == bookId }
+}
+
+/** Restore a visual page before the optional full listening index has been decoded. */
+internal fun resolveReadingResumeProgress(
+    record: BookRecord,
+    persisted: ReadingProgress,
+    stopped: ReadingProgress?,
+    activeAudioBookId: String?,
+    intent: ReadingPlaybackIntent,
+    cachedBook: SpeechBook?,
+): ReadingProgress? {
+    if (cachedBook != null) return resolveResumeProgress(cachedBook, persisted, stopped, activeAudioBookId, intent)
+    require(record.sentenceCount > 0) { "A reading book must contain speech sentences." }
+    if (intent == ReadingPlaybackIntent.FROM_READING_LOCATION) return null
+    stopped?.takeIf { it.bookId == record.id }?.let { progress ->
+        return progress.copy(sentenceIndex = progress.sentenceIndex.coerceIn(0, record.sentenceCount - 1),
+            audioOffsetMs = progress.audioOffsetMs.coerceAtLeast(0))
+    }
+    if (activeAudioBookId == record.id) return null
+    return persisted.takeIf { it.bookId == record.id }
 }

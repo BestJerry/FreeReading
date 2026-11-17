@@ -56,6 +56,14 @@ class ReadingAudioService : MediaSessionService() {
     private var transitionToken: Long? = null
     private var operation: Job? = null
     private var prefetch: Job? = null
+    private var voiceLookup: Job? = null
+    private var voiceLookupRequestId: String? = null
+    private var voiceLookupSelecting = false
+    private var latestVoiceRequestId: String? = null
+    private var switchingVoiceRequestId: String? = null
+    private var switchingVoiceCatalog: TtsVoiceCatalog? = null
+    private var destroyed = false
+    private var latestStartId = 0
     private val clips = mutableMapOf<Int, SynthesizedSentence>()
     private val relativeSeeks = RelativeSeekAccumulator()
     private val persistenceMutex = Mutex()
@@ -152,6 +160,7 @@ class ReadingAudioService : MediaSessionService() {
         if (controllerInfo.isTrusted || controllerInfo.packageName == packageName) session else null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId = startId
         if (intent != null) {
             val action = intent.action
             if (action != null && action in PRIVATE_ACTIONS && !PlaybackHub.isAuthorizedCommand(intent)) {
@@ -194,9 +203,119 @@ class ReadingAudioService : MediaSessionService() {
             ACTION_NEXT -> moveRelative(1)
             ACTION_PREVIOUS -> moveRelative(-1)
             ACTION_STOP -> stopPlayback()
+            ACTION_LOAD_VOICES, ACTION_SELECT_VOICE -> handleVoiceRequest(intent)
             else -> return super.onStartCommand(intent, flags, startId)
         }
         return START_NOT_STICKY
+    }
+
+    private fun handleVoiceRequest(intent: Intent) {
+        val id = intent.getStringExtra(EXTRA_BOOK_ID) ?: return
+        val language = intent.getStringExtra(EXTRA_LANGUAGE).orEmpty()
+        val requestId = intent.getStringExtra(EXTRA_VOICE_REQUEST_ID) ?: return
+        // A delayed startService intent must not replace a newer request already shown by the UI.
+        if (PlaybackHub.voiceState.value.requestId != requestId) return
+        latestVoiceRequestId = requestId
+        val selecting = intent.action == ACTION_SELECT_VOICE
+        val currentBook = book
+        val catalogLanguage = currentBook?.takeIf { it.book.id == id }?.book?.language ?: language
+        val owner = currentBook?.book?.id ?: PlaybackHub.state.value.bookId.takeIf {
+            transitionToken != null || player.mediaItemCount > 0
+        }
+        if (selecting && owner != null && owner != id) {
+            publishVoiceResult(requestId, error = getString(R.string.audio_voice_other_book))
+            return
+        }
+        if (selecting && owner != null && currentBook == null) {
+            publishVoiceResult(requestId, error = getString(R.string.audio_voice_request_interrupted))
+            return
+        }
+        val voiceId = intent.getStringExtra(EXTRA_VOICE_ID)
+        if (selecting && currentBook != null) {
+            relativeSeeks.clear()
+            val index = currentIndex().coerceIn(0, currentBook.sentences.lastIndex)
+            val old = PlaybackHub.state.value
+            val position = if (transitionToken == null && player.mediaItemCount > 0)
+                player.currentPosition.coerceAtLeast(0) else old.positionMs
+            val duration = clips[index]?.durationMs ?: old.durationMs
+            val fraction = if (duration > 0) (position.toDouble() / duration).coerceIn(0.0, 1.0) else null
+            // Preserve this cursor before clearMediaItems() loses the player's current item.
+            publishPreparing(currentBook, index, position)
+            beginTransition(voiceRequestId = requestId) { token ->
+                val catalog = speech.selectVoice(currentBook.book.language, voiceId)
+                ensureActiveGeneration(token)
+                switchingVoiceCatalog = catalog
+                openSentence(currentBook, index, position, token, fraction)
+                if (switchingVoiceRequestId == requestId) {
+                    switchingVoiceRequestId = null
+                    switchingVoiceCatalog = null
+                }
+                publishVoiceResult(requestId, catalog)
+            }
+            return
+        }
+
+        val oldLookup = voiceLookup
+        val oldPrefetch = prefetch
+        // Replace the guard before cancellation; an inline old finally must not restart prefetch.
+        voiceLookupRequestId = requestId
+        voiceLookupSelecting = selecting
+        // Reading a catalog must not wait for speculative sentences, nor stop initial audio.
+        oldLookup?.cancel()
+        oldPrefetch?.cancel()
+        val pendingOperation = operation.takeIf { transitionToken != null }
+        val token = generation
+        voiceLookup = serviceScope.launch {
+            try {
+                oldLookup?.join()
+                oldPrefetch?.join()
+                pendingOperation?.join()
+                val catalog = if (selecting) speech.selectVoice(catalogLanguage, voiceId) else speech.voices(catalogLanguage)
+                publishVoiceResult(requestId, catalog)
+            } catch (cancelled: CancellationException) {
+                // resetEngine() can cancel an initialization wait without destroying the service.
+                // A selection may already have saved its preference before Main saw its result.
+                publishVoiceResult(requestId, error = getString(R.string.audio_voice_request_interrupted),
+                    clearCatalog = selecting)
+                throw cancelled
+            } catch (failure: Exception) {
+                publishVoiceResult(requestId, error = voiceFailureMessage(failure))
+            } finally {
+                if (voiceLookupRequestId == requestId) {
+                    voiceLookupRequestId = null
+                    if (!destroyed && generation == token) startPrefetch()
+                    if (!destroyed && book == null && transitionToken == null && player.mediaItemCount == 0) {
+                        // A later STOP also needs cleanup; an accepted PLAY owns book/transition.
+                        stopSelf(latestStartId)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun publishVoiceResult(requestId: String, catalog: TtsVoiceCatalog? = null,
+                                   error: String? = null, clearCatalog: Boolean = false) {
+        if (destroyed || latestVoiceRequestId != requestId || PlaybackHub.voiceState.value.requestId != requestId) return
+        val old = PlaybackHub.voiceState.value
+        PlaybackHub.publishVoices(old.copy(loading = false, switching = false,
+            catalog = if (clearCatalog) null else catalog ?: old.catalog, error = error))
+    }
+
+    private fun voiceFailureMessage(failure: Exception): String =
+        (failure as? AudioFailure)?.userMessage ?: getString(R.string.audio_voice_selection_failed)
+
+    private fun interruptVoiceSwitch(error: String = getString(R.string.audio_voice_request_interrupted)) {
+        switchingVoiceRequestId?.let { requestId ->
+            if (switchingVoiceCatalog == null && latestVoiceRequestId == requestId &&
+                PlaybackHub.voiceState.value.requestId == requestId) {
+                // Cancellation may arrive after IO saved the preference but before its result
+                // resumed here. Do not present the previous radio as a confirmed current choice.
+                PlaybackHub.publishVoices(PlaybackHub.voiceState.value.copy(loading = false,
+                    switching = false, catalog = null, error = error))
+            } else publishVoiceResult(requestId, switchingVoiceCatalog, error)
+        }
+        switchingVoiceRequestId = null
+        switchingVoiceCatalog = null
     }
 
     private fun playBook(id: String, index: Int, offsetMs: Long,
@@ -285,13 +404,22 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     /** Cancels and joins both workers before the next generation may touch TTS or the queue. */
-    private fun beginTransition(block: suspend (Long) -> Unit) {
+    private fun beginTransition(voiceRequestId: String? = null, block: suspend (Long) -> Unit) {
         val oldOperation = operation
         val oldPrefetch = prefetch
-        oldOperation?.cancel()
-        oldPrefetch?.cancel()
+        val pendingVoiceLookup = voiceLookup
+        // Mark the transition before cancellation can run an old query's finally inline.
         val token = ++generation
         transitionToken = token
+        if ((!voiceLookupSelecting || voiceRequestId != null) && pendingVoiceLookup?.isActive == true) {
+            voiceLookupRequestId?.let { publishVoiceResult(it,
+                error = getString(R.string.audio_voice_request_interrupted)) }
+            pendingVoiceLookup.cancel()
+        }
+        oldOperation?.cancel()
+        oldPrefetch?.cancel()
+        interruptVoiceSwitch()
+        switchingVoiceRequestId = voiceRequestId
         PlaybackHub.publish(PlaybackHub.state.value.copy(isPreparing = true, isPlaying = false,
             error = null, needsVoiceData = false))
         player.stop()
@@ -305,6 +433,7 @@ class ReadingAudioService : MediaSessionService() {
             try {
                 oldOperation?.join()
                 oldPrefetch?.join()
+                pendingVoiceLookup?.join()
                 ensureActiveGeneration(token)
                 speech.protect(emptyList())
                 block(token)
@@ -316,13 +445,16 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
-    private suspend fun openSentence(currentBook: SpeechBook, index: Int, position: Long, token: Long) {
+    private suspend fun openSentence(currentBook: SpeechBook, index: Int, position: Long, token: Long,
+                                     resumeFraction: Double? = null) {
         val clip = speech.ensure(currentBook.book.id, currentBook.sentences[index], currentBook.book.language)
         ensureActiveGeneration(token)
         clips.clear()
         clips[index] = clip
         speech.protect(listOf(clip.file))
-        player.setMediaItem(mediaItem(currentBook, index, clip), position.coerceIn(0, clip.durationMs))
+        // Voices have different timing; only the sentence's relative position can be retained.
+        val resumePosition = resumeFraction?.let { (it * clip.durationMs).toLong() } ?: position
+        player.setMediaItem(mediaItem(currentBook, index, clip), resumePosition.coerceIn(0, clip.durationMs))
         transitionToken = null
         player.prepare()
         refreshSnapshot()
@@ -332,7 +464,8 @@ class ReadingAudioService : MediaSessionService() {
 
     private fun startPrefetch() {
         val currentBook = book ?: return
-        if (transitionToken != null || prefetch?.isActive == true || player.mediaItemCount == 0) return
+        if (transitionToken != null || voiceLookupRequestId != null ||
+            prefetch?.isActive == true || player.mediaItemCount == 0) return
         val token = generation
         prefetch = serviceScope.launch {
             try {
@@ -450,6 +583,7 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     private fun stopPlayback() {
+        interruptVoiceSwitch()
         relativeSeeks.clear()
         val progress = captureProgress()
         val oldOperation = operation
@@ -475,11 +609,12 @@ class ReadingAudioService : MediaSessionService() {
             PlaybackHub.publish(PlaybackSnapshot(speed = player.playbackParameters.speed,
                 startFailure = PlaybackHub.state.value.startFailure))
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            if (voiceLookupRequestId == null) stopSelf()
         }
     }
 
     private fun reportFailure(failure: Exception) {
+        interruptVoiceSwitch(voiceFailureMessage(failure))
         relativeSeeks.clear()
         generation += 1
         prefetch?.cancel()
@@ -533,6 +668,13 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        val voiceState = PlaybackHub.voiceState.value
+        if (voiceState.loading || voiceState.switching) PlaybackHub.publishVoices(voiceState.copy(
+            loading = false, switching = false,
+            catalog = if (voiceState.switching || switchingVoiceRequestId != null)
+                switchingVoiceCatalog else voiceState.catalog,
+            error = getString(R.string.audio_voice_request_interrupted)))
         val progress = captureProgress()
         val store = repository
         val storeMutex = persistenceMutex
@@ -563,14 +705,19 @@ class ReadingAudioService : MediaSessionService() {
         internal const val ACTION_NEXT = "com.freereading.audio.NEXT"
         internal const val ACTION_PREVIOUS = "com.freereading.audio.PREVIOUS"
         internal const val ACTION_STOP = "com.freereading.audio.STOP"
+        internal const val ACTION_LOAD_VOICES = "com.freereading.audio.LOAD_VOICES"
+        internal const val ACTION_SELECT_VOICE = "com.freereading.audio.SELECT_VOICE"
         private val PRIVATE_ACTIONS = setOf(ACTION_PLAY_BOOK, ACTION_TOGGLE, ACTION_SEEK_BY,
-            ACTION_SPEED, ACTION_NEXT, ACTION_PREVIOUS, ACTION_STOP)
+            ACTION_SPEED, ACTION_NEXT, ACTION_PREVIOUS, ACTION_STOP, ACTION_LOAD_VOICES, ACTION_SELECT_VOICE)
         internal const val EXTRA_BOOK_ID = "book_id"
         internal const val EXTRA_INDEX = "sentence_index"
         internal const val EXTRA_POSITION = "position_ms"
         internal const val EXTRA_PLAYBACK_SESSION_ID = "playback_session_id"
         internal const val EXTRA_DELTA = "delta_ms"
         internal const val EXTRA_SPEED = "speed"
+        internal const val EXTRA_LANGUAGE = "language"
+        internal const val EXTRA_VOICE_REQUEST_ID = "voice_request_id"
+        internal const val EXTRA_VOICE_ID = "voice_id"
         private const val SEEK_MS = 15_000L
         private const val PREFETCH_SENTENCES = 4
         private const val CHANNEL_ID = "reading_playback"

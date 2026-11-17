@@ -19,6 +19,7 @@ import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,6 +40,8 @@ class BookRepository(context: Context) {
     private val mutations = Mutex()
     private val progressLock = Any()
     private val progressCache = HashMap<String, ReadingProgress>()
+    private val readingSavesLock = Any()
+    private val readingSaves = HashMap<String, MutableSet<PendingReadingSave>>()
     private val indexStore = SpeechIndexStore()
     private val speechBookCache = HashMap<String, CachedSpeechBook>()
     private val mutableBooks = MutableStateFlow<List<BookRecord>>(emptyList())
@@ -123,6 +126,89 @@ class BookRepository(context: Context) {
         }
     }
 
+    /** A reading page only needs metadata and its visual cursor; full speech stays lazy. */
+    suspend fun prepareReadingBook(bookId: String): ReadingBookBootstrap = withContext(Dispatchers.IO) {
+        awaitReadingSaves(bookId)
+        mutations.withLock {
+            val dir = directory(bookId)
+            try {
+                val record = readRecord(dir)
+                if (!File(dir, BOOK_FILE).isFile) throw BookImportException("书籍原文件已不存在，请重新导入")
+                val textVersion = readTextIndexVersion(dir)
+                if (textVersion > TEXT_INDEX_VERSION) throw BookImportException("书籍索引来自更新版本，请更新应用后打开")
+                if (textVersion < TEXT_INDEX_VERSION) {
+                    // A legacy visual/audio cursor cannot be used until its index has been rebased.
+                    val migrated = try {
+                        migrateTextIndex(dir, record)
+                    } catch (error: BookImportException) {
+                        throw error
+                    } catch (error: IOException) {
+                        throw BookImportException("书籍定位更新未完成，请检查设备剩余空间后重试", error)
+                    }
+                    return@withLock ReadingBookBootstrap(migrated.book, progress(bookId), migrated)
+                }
+                // Recover an interrupted AtomicFile write without scanning the JSON/source table.
+                AtomicFile(File(dir, INDEX_FILE)).openRead().use { input ->
+                    if (input.channel.size() !in 1L..SpeechIndexLimits.MAX_INDEX_BYTES) {
+                        throw IOException("Speech index is empty or too large")
+                    }
+                }
+                deleteLegacyIndex(dir)
+                val stamp = cacheStamp(dir)
+                val cached = speechBookCache[bookId]
+                val full = if (stamp != null && cached?.record == record && cached.stamp == stamp) {
+                    cached.reference.get()
+                } else null
+                if (full == null) speechBookCache.remove(bookId)
+                ReadingBookBootstrap(record, progress(bookId), full)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: BookImportException) {
+                speechBookCache.remove(bookId)
+                throw error
+            } catch (error: Exception) {
+                speechBookCache.remove(bookId)
+                throw BookImportException("书籍读取未完成，请检查书籍文件后重试", error)
+            }
+        }
+    }
+
+    /** A quick reopen of this book must observe its previous reader's final saved cursor. */
+    internal fun registerReadingSave(bookId: String, expectedAddedAt: Long, job: Job) {
+        val pending = PendingReadingSave(expectedAddedAt, job)
+        synchronized(readingSavesLock) {
+            readingSaves.getOrPut(bookId) { HashSet() }.add(pending)
+        }
+        job.invokeOnCompletion {
+            synchronized(readingSavesLock) {
+                readingSaves[bookId]?.let { saves ->
+                    saves.remove(pending)
+                    if (saves.isEmpty()) readingSaves.remove(bookId)
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitReadingSaves(bookId: String) {
+        while (true) {
+            val pending = synchronized(readingSavesLock) { readingSaves[bookId]?.toList().orEmpty() }
+            if (pending.isEmpty()) return
+            val addedAt = try {
+                synchronized(progressLock) { readRecord(directory(bookId)).addedAt }
+            } catch (_: Exception) {
+                // The ordinary preparation path reports missing/corrupt metadata consistently.
+                return
+            }
+            val sameGeneration = synchronized(readingSavesLock) {
+                readingSaves[bookId].orEmpty().filter { it.expectedAddedAt == addedAt && !it.job.isCompleted }
+            }
+            if (sameGeneration.isEmpty()) return
+            // Neither the book mutation mutex nor the registry/progress lock may be held here:
+            // a final save can need loadSpeechBook() before it can commit its cursor.
+            sameGeneration.forEach { it.job.join() }
+        }
+    }
+
     suspend fun loadSpeechBook(bookId: String): SpeechBook = withContext(Dispatchers.IO) {
         mutations.withLock {
             val dir = directory(bookId)
@@ -168,10 +254,15 @@ class BookRepository(context: Context) {
         progressCache[bookId] ?: readProgress(dir, bookId).also { progressCache[bookId] = it }
     }
 
-    fun saveProgress(progress: ReadingProgress): Unit = synchronized(progressLock) {
+    fun saveProgress(progress: ReadingProgress, expectedAddedAt: Long? = null): Unit = synchronized(progressLock) {
         val dir = directory(progress.bookId)
         // A delayed player/reader callback must never recreate a removed book.
         if (!dir.isDirectory || !File(dir, METADATA_FILE).isFile) return@synchronized
+        if (expectedAddedAt != null) {
+            // A deferred reader save may outlive deletion and reimport of the same EPUB hash.
+            val currentAddedAt = try { readRecord(dir).addedAt } catch (_: Exception) { return@synchronized }
+            if (currentAddedAt != expectedAddedAt) return@synchronized
+        }
         val previous = progressCache[progress.bookId] ?: readProgress(dir, progress.bookId)
         if (progress.updatedAt < previous.updatedAt) return@synchronized
         val cleaned = progress.copy(
@@ -446,6 +537,7 @@ class BookRepository(context: Context) {
         indexStore.read(file, record.id, record.sentenceCount)
 
     private data class FileStamp(val length: Long, val modified: Long)
+    private class PendingReadingSave(val expectedAddedAt: Long, val job: Job)
     private data class CachedSpeechBook(
         val record: BookRecord,
         val stamp: List<FileStamp>,
