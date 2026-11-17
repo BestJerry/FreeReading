@@ -2,14 +2,16 @@
 
 FreeReading 是使用 **Kotlin 和 Jetpack Compose** 开发的 Android 原生本地 EPUB 阅读器，提供阅读与系统 TTS 听书之间的句级定位。
 
+项目仓库：[BestJerry/FreeReading_android](https://github.com/BestJerry/FreeReading_android)。
+
 当前版本：**0.1.10**。支持 **Android 8.0（API 26）及以上**。
 
 ## 下载安装
 
 当前测试安装包为 **v0.1.10**。本次完善并核对 45 个业务源码文件的中文注释，阅读与听书功能延续 v0.1.9。
 
-- [下载 v0.1.10 Android APK](https://github.com/BestJerry/FreeReading/releases/download/v0.1.10/FreeReading-v0.1.10.apk)
-- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading/releases/tag/v0.1.10)
+- [下载 v0.1.10 Android APK](https://github.com/BestJerry/FreeReading_android/releases/download/v0.1.10/FreeReading-v0.1.10.apk)
+- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading_android/releases/tag/v0.1.10)
 
 下载 APK 后，按 Android 系统提示允许该下载来源安装应用，即可安装。当前发布的是 **Debug 签名测试包**；同签名的已有测试版可覆盖安装，保留书架与进度。听书需在系统语音设置中安装对应语言的离线音色。本轮通过本地单测、构建和静态检查，未进行真机复测。
 
