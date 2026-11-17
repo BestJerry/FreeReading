@@ -26,6 +26,18 @@ internal class ChapterProgressIndex(sentences: List<SpeechSentence>) {
         for (member in start until sentences.size) chapterEnds[member] = sentences.size
     }
 
+    /** A chapter command always targets the adjacent chapter's first sentence. */
+    fun previousChapterStart(index: Int): Int? {
+        require(index in chapterStarts.indices) { "Sentence index is outside the book" }
+        val start = chapterStarts[index]
+        return if (start > 0) chapterStarts[start - 1] else null
+    }
+
+    fun nextChapterStart(index: Int): Int? {
+        require(index in chapterStarts.indices) { "Sentence index is outside the book" }
+        return chapterEnds[index].takeIf { it < chapterStarts.size }
+    }
+
     /** Global sentence index and current clip media time map to an O(1), finite chapter fraction. */
     fun at(index: Int, positionMs: Long, durationMs: Long): ChapterProgress {
         require(index in chapterStarts.indices) { "Sentence index is outside the book" }

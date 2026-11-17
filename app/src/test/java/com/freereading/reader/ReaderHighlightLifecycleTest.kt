@@ -36,6 +36,7 @@ import org.readium.r2.navigator.Decoration
 import org.readium.r2.navigator.epub.EpubNavigatorFragment
 import org.readium.r2.navigator.input.DragEvent
 import org.readium.r2.navigator.input.InputListener
+import org.readium.r2.navigator.input.TapEvent
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
 import org.json.JSONObject
@@ -247,6 +248,55 @@ class ReaderHighlightLifecycleTest {
 
         assertEquals(book.sentences[nextChapter].source!!.locator.href, jumps.last().href)
         assertTrue(following())
+    }
+
+    @Test fun leftCenterAndRightTapsOnlyToggleControlsAndKeepAudioFollowing() {
+        val jumps = recordNavigation()
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "followCurrentAudio")
+        pageListener().onPageLoaded()
+        await("initial followed page") { jumps.isNotEmpty() }
+        jumps.clear()
+        requireNotNull(fragment.view).layout(0, 0, 1_000, 1_200)
+        val page = fragment.currentLocator.value
+        val revision = ReflectionHelpers.getField<Long>(activity, "readingNavigationRevision")
+        val listener = readingInputListener()
+
+        for (x in listOf(20f, 500f, 980f)) {
+            assertTrue(listener.onTap(TapEvent(PointF(x, 600f))))
+            assertTrue(ReflectionHelpers.callInstanceMethod(activity, "getShowReadingControls"))
+            assertTrue(listener.onTap(TapEvent(PointF(x, 600f))))
+            assertFalse(ReflectionHelpers.callInstanceMethod(activity, "getShowReadingControls"))
+            assertEquals(page, fragment.currentLocator.value)
+            assertEquals(revision, ReflectionHelpers.getField<Long>(activity, "readingNavigationRevision"))
+            assertEquals(ReadingPlaybackIntent.CONTINUE_AUDIO,
+                ReflectionHelpers.callInstanceMethod<ReadingPlaybackIntent>(activity, "getReadingPlaybackIntent"))
+            assertTrue(following())
+            assertTrue(jumps.isEmpty())
+        }
+
+        PlaybackHub.publish(snapshot(2).copy(isPlaying = true))
+        await("narration still follows after menu taps") { jumps.lastOrNull() == locator(2) }
+    }
+
+    @Test fun menuTapsDoNotCancelAPendingReadingLocationLookup() {
+        val pending = Job()
+        val requested = locator(1)
+        ReflectionHelpers.setField(activity, "readingStartJob", pending)
+        ReflectionHelpers.setField(activity, "requestedReadingStart", requested)
+        val revision = ReflectionHelpers.getField<Long>(activity, "readingNavigationRevision")
+        val listener = readingInputListener()
+        requireNotNull(fragment.view).layout(0, 0, 1_000, 1_200)
+        try {
+            for (x in listOf(20f, 500f, 980f)) {
+                assertTrue(listener.onTap(TapEvent(PointF(x, 600f))))
+                assertTrue(pending.isActive)
+                assertSame(pending, ReflectionHelpers.getField<Job>(activity, "readingStartJob"))
+                assertSame(requested, ReflectionHelpers.getField<Locator>(activity, "requestedReadingStart"))
+                assertEquals(revision, ReflectionHelpers.getField<Long>(activity, "readingNavigationRevision"))
+                assertEquals(ReadingPlaybackIntent.FROM_READING_LOCATION,
+                    ReflectionHelpers.callInstanceMethod<ReadingPlaybackIntent>(activity, "getReadingPlaybackIntent"))
+            }
+        } finally { pending.cancel() }
     }
 
     @Test fun tinyTouchMovementKeepsAutomaticPagingAndRealBrowsingCanResumeFromTheFooterAction() {

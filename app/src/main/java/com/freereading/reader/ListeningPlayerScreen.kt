@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -107,6 +109,8 @@ internal fun ListeningPlayerScreen(
     onLoadVoices: () -> Unit,
     onSelectVoice: (String?) -> Unit,
     modifier: Modifier = Modifier,
+    onPreviousChapter: () -> Unit = {},
+    onNextChapter: () -> Unit = {},
 ) {
     val muted = ink.copy(alpha = 0.62f)
     val controlsEnabled = activeBook
@@ -197,6 +201,17 @@ internal fun ListeningPlayerScreen(
                         }
                         ListeningSeekButton(Icons.Default.FastForward, "快进15秒", controlsEnabled, ink) { onSeek(15_000L) }
                     }
+                    Row(Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        ListeningChapterButton(Icons.Default.SkipPrevious, "上一章",
+                            enabled = activeBook && snapshot.canGoToPreviousChapter, ink = ink,
+                            modifier = Modifier.weight(1f).testTag("listening-previous-chapter"),
+                            onClick = onPreviousChapter)
+                        ListeningChapterButton(Icons.Default.SkipNext, "下一章",
+                            enabled = activeBook && snapshot.canGoToNextChapter, ink = ink,
+                            modifier = Modifier.weight(1f).testTag("listening-next-chapter"),
+                            onClick = onNextChapter)
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.weight(0.35f)) {
@@ -282,6 +297,25 @@ internal fun ListeningPlayerScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ListeningChapterButton(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean,
+    ink: Color,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(onClick = onClick, enabled = enabled,
+        border = BorderStroke(1.dp, ink.copy(alpha = 0.14f)),
+        modifier = modifier.semantics { contentDescription = label }) {
+        Icon(icon, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(label, modifier = Modifier.weight(1f), fontSize = 13.sp, maxLines = 2,
+            textAlign = TextAlign.Center)
     }
 }
 

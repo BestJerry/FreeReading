@@ -37,6 +37,8 @@ data class PlaybackSnapshot(
     // Changes only when the service accepts a new book/start request, not on each sentence.
     val playbackSessionId: String? = null,
     val startFailure: PlaybackStartFailure? = null,
+    val canGoToPreviousChapter: Boolean = false,
+    val canGoToNextChapter: Boolean = false,
 )
 
 /** One process-wide stream; activities never own the player or TTS lifecycle. */
@@ -111,6 +113,10 @@ object PlaybackHub {
     }
     fun next(context: Context) = send(context, ReadingAudioService.ACTION_NEXT)
     fun previous(context: Context) = send(context, ReadingAudioService.ACTION_PREVIOUS)
+    fun previousChapter(context: Context, bookId: String) = sendChapter(context,
+        ReadingAudioService.ACTION_PREVIOUS_CHAPTER, bookId)
+    fun nextChapter(context: Context, bookId: String) = sendChapter(context,
+        ReadingAudioService.ACTION_NEXT_CHAPTER, bookId)
     fun stop(context: Context) = send(context, ReadingAudioService.ACTION_STOP)
 
     internal fun loadVoices(context: Context, bookId: String, language: String) =
@@ -169,6 +175,10 @@ object PlaybackHub {
         val intent = command(context, action)
         if (key != null) intent.putExtra(key, value)
         sendIntent(context, intent)
+    }
+    private fun sendChapter(context: Context, action: String, bookId: String) {
+        if (!serviceAlive || state.value.bookId != bookId) return
+        sendIntent(context, command(context, action).putExtra(ReadingAudioService.EXTRA_BOOK_ID, bookId))
     }
     private fun sendIntent(context: Context, intent: Intent) {
         try { context.applicationContext.startService(intent) }

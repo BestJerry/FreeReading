@@ -6,6 +6,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -250,12 +251,104 @@ class ReaderSurfacesTest {
         compose.onNodeWithText("第七章 山间").assertDoesNotExist()
         compose.onNodeWithContentDescription("章节播放进度").performScrollTo()
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "—"))
-        listOf("快退15秒", "快进15秒", "播放速度", "跟随原文", "定位正在朗读的原文", "结束听书", "选择朗读音色")
+        listOf("快退15秒", "快进15秒", "上一章", "下一章", "播放速度", "跟随原文", "定位正在朗读的原文", "结束听书", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertIsNotEnabled() }
         clickListening("开始或继续听书")
         clickListening("从阅读位置开始听书")
 
         compose.runOnIdle { assertEquals(listOf("toggle", "from-reading"), events) }
+    }
+
+    @Test fun chapterButtonsDispatchTheirOwnActionsWithoutClosingOrChangingTransport() {
+        val events = showListening()
+
+        compose.onNodeWithTag("listening-previous-chapter").performScrollTo().assertIsDisplayed()
+            .assertIsEnabled().performClick()
+        compose.onNodeWithTag("listening-next-chapter").assertIsDisplayed().assertIsEnabled().performClick()
+        clickListening("快退15秒")
+        clickListening("快进15秒")
+        clickListening("暂停听书")
+
+        compose.onNodeWithTag("listening-screen").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals(listOf("previous-chapter", "next-chapter", "seek:-15000", "seek:15000", "toggle"), events)
+        }
+    }
+
+    @Test fun theFirstChapterDisablesPreviousButKeepsNextAvailable() {
+        val events = showListening(snapshot = sampleSnapshot().copy(canGoToPreviousChapter = false))
+
+        compose.onNodeWithTag("listening-previous-chapter").performScrollTo().assertIsNotEnabled()
+        clickListening("下一章")
+
+        compose.runOnIdle { assertEquals(listOf("next-chapter"), events) }
+    }
+
+    @Test fun theLastChapterDisablesNextButKeepsPreviousAvailable() {
+        val events = showListening(snapshot = sampleSnapshot().copy(canGoToNextChapter = false))
+
+        compose.onNodeWithTag("listening-next-chapter").performScrollTo().assertIsNotEnabled()
+        clickListening("上一章")
+
+        compose.runOnIdle { assertEquals(listOf("previous-chapter"), events) }
+    }
+
+    @Test fun aSingleSpokenChapterDisablesBothChapterButtonsButRetainsTransport() {
+        val events = showListening(snapshot = sampleSnapshot().copy(
+            canGoToPreviousChapter = false, canGoToNextChapter = false))
+
+        compose.onNodeWithTag("listening-previous-chapter").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("listening-next-chapter").assertIsNotEnabled()
+        clickListening("快进15秒")
+
+        compose.runOnIdle { assertEquals(listOf("seek:15000"), events) }
+    }
+
+    @Test fun chapterButtonsStayAvailableDuringDocumentLoadingAndSentencePreparation() {
+        val events = showListening(enabled = false, snapshot = sampleSnapshot().copy(
+            isPlaying = false, isPreparing = true))
+
+        clickListening("上一章")
+        clickListening("下一章")
+        clickListening("下一章")
+
+        compose.onNodeWithContentDescription("从阅读位置开始听书").assertIsNotEnabled()
+        compose.onNodeWithTag("listening-screen").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(listOf("previous-chapter", "next-chapter", "next-chapter"), events) }
+    }
+
+    @Test fun aPausedBookCanRequestAChapterWithoutAnOptimisticPlaybackToggle() {
+        val events = showListening(snapshot = sampleSnapshot().copy(isPlaying = false))
+
+        clickListening("下一章")
+
+        compose.onNodeWithText("已暂停").performScrollTo().assertIsDisplayed()
+        compose.runOnIdle { assertEquals(listOf("next-chapter"), events) }
+    }
+
+    @Test fun stoppedOrNotYetStartedAudioCannotRequestChapterChanges() {
+        val events = showListening(activeBook = false, snapshot = PlaybackSnapshot())
+
+        compose.onNodeWithTag("listening-previous-chapter").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("listening-next-chapter").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("返回阅读").performClick()
+
+        compose.runOnIdle { assertEquals(listOf("close"), events) }
+    }
+
+    @Test
+    @Config(qualifiers = "w320dp-h640dp")
+    fun narrowNightPlayerWithLargeTextCanReachAndUseBothChapterButtons() {
+        val events = showListening(fontScale = 1.8f, paper = Color(0xFF1E2422),
+            ink = Color(0xFFE4E9E3), accent = Color(0xFFB5CDB5))
+
+        compose.onNodeWithTag("listening-previous-chapter").performScrollTo()
+            .assertIsDisplayed().assertIsEnabled().performClick()
+        compose.onNodeWithTag("listening-next-chapter").assertIsDisplayed().assertIsEnabled().performClick()
+        compose.onNodeWithContentDescription("返回阅读").assertIsDisplayed()
+        compose.onNodeWithTag("listening-screen").assertIsDisplayed()
+
+        compose.runOnIdle { assertEquals(listOf("previous-chapter", "next-chapter"), events) }
     }
 
     @Test fun voiceChoicesAreAvailableBeforePlaybackAndRefreshEveryTimeTheyOpen() {
@@ -337,7 +430,7 @@ class ReaderSurfacesTest {
         val events = showListening(activeBook = false, enabled = false,
             snapshot = sampleSnapshot().copy(error = "其他书的离线语音错误", needsVoiceData = true))
 
-        listOf("开始或继续听书", "快退15秒", "快进15秒", "播放速度", "跟随原文",
+        listOf("开始或继续听书", "快退15秒", "快进15秒", "上一章", "下一章", "播放速度", "跟随原文",
             "定位正在朗读的原文", "从阅读位置开始听书", "结束听书", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertIsNotEnabled() }
         compose.onNodeWithContentDescription("安装或设置离线语音").assertDoesNotExist()
@@ -383,7 +476,7 @@ class ReaderSurfacesTest {
     }
 
     private fun assertNoFullPlayerControls() {
-        listOf("暂停听书", "开始或继续听书", "快退15秒", "快进15秒", "播放速度",
+        listOf("暂停听书", "开始或继续听书", "快退15秒", "快进15秒", "上一章", "下一章", "播放速度",
             "结束听书", "从阅读位置开始听书", "定位正在朗读的原文", "选择朗读音色")
             .forEach { compose.onNodeWithContentDescription(it).assertDoesNotExist() }
         compose.onNodeWithTag("listening-screen").assertDoesNotExist()
@@ -428,19 +521,28 @@ class ReaderSurfacesTest {
         activeBook: Boolean = true,
         enabled: Boolean = true,
         voiceState: TtsVoiceUiState = TtsVoiceUiState(),
+        fontScale: Float = 1f,
+        paper: Color = Paper,
+        ink: Color = Ink,
+        accent: Color = Forest,
     ): MutableList<String> {
         val events = mutableListOf<String>()
         compose.setContent {
-            FreeReadingTheme {
-                ListeningPlayerScreen(bookTitle = snapshot.bookTitle, author = "示例作者", coverPath = null,
-                    snapshot = snapshot, activeBook = activeBook, enabled = enabled, followAudio = true,
-                    paper = Paper, ink = Ink, accent = Forest,
-                    onClose = { events += "close" }, onToggle = { events += "toggle" },
-                    onSeek = { events += "seek:$it" }, onSpeed = { events += "speed:$it" },
-                    onFromReading = { events += "from-reading" }, onFollowToggle = { events += "follow" },
-                    onLocate = { events += "locate" }, onStop = { events += "stop" },
-                    onVoiceSettings = { events += "voice-settings" }, voiceState = voiceState,
-                    onLoadVoices = { events += "load-voices" }, onSelectVoice = { events += "voice:$it" })
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
+                FreeReadingTheme {
+                    ListeningPlayerScreen(bookTitle = snapshot.bookTitle, author = "示例作者", coverPath = null,
+                        snapshot = snapshot, activeBook = activeBook, enabled = enabled, followAudio = true,
+                        paper = paper, ink = ink, accent = accent,
+                        onClose = { events += "close" }, onToggle = { events += "toggle" },
+                        onSeek = { events += "seek:$it" }, onSpeed = { events += "speed:$it" },
+                        onFromReading = { events += "from-reading" }, onFollowToggle = { events += "follow" },
+                        onLocate = { events += "locate" }, onStop = { events += "stop" },
+                        onVoiceSettings = { events += "voice-settings" }, voiceState = voiceState,
+                        onLoadVoices = { events += "load-voices" }, onSelectVoice = { events += "voice:$it" },
+                        onPreviousChapter = { events += "previous-chapter" },
+                        onNextChapter = { events += "next-chapter" })
+                }
             }
         }
         return events
@@ -449,7 +551,8 @@ class ReaderSurfacesTest {
     private fun sampleSnapshot() = PlaybackSnapshot(bookId = "book-a", bookTitle = "山间来信",
         sentenceIndex = 12, sentenceCount = 80, chapterTitle = "第七章 山间", text = SpokenText,
         positionMs = 5_000, durationMs = 10_000, chapterProgress = 0.37f,
-        chapterSentenceCount = 20, isPlaying = true)
+        chapterSentenceCount = 20, isPlaying = true,
+        canGoToPreviousChapter = true, canGoToNextChapter = true)
 
     private companion object { const val SpokenText = "沿着山路，我们听见了风穿过树林的声音。" }
 }

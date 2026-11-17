@@ -371,21 +371,8 @@ class ReaderActivity : FragmentActivity() {
         observeAudio(fragment)
         fragment.addInputListener(object : InputListener {
             override fun onTap(event: TapEvent): Boolean {
-                val width = fragment.view?.width ?: return false
-                return when {
-                    event.point.x < width * 0.22f -> {
-                        markManualNavigation()
-                        fragment.goBackward(animated = true)
-                    }
-                    event.point.x > width * 0.78f -> {
-                        markManualNavigation()
-                        fragment.goForward(animated = true)
-                    }
-                    else -> {
-                        showReadingControls = !showReadingControls
-                        true
-                    }
-                }
+                showReadingControls = !showReadingControls
+                return true
             }
 
             override fun onDrag(event: DragEvent): Boolean {
@@ -1005,7 +992,7 @@ class ReaderActivity : FragmentActivity() {
         }
         ReaderChrome(
             title = title,
-            chapter = visibleLocator?.title?.takeIf(String::isNotBlank) ?: "点按中央打开阅读菜单",
+            chapter = visibleLocator?.title?.takeIf(String::isNotBlank) ?: "轻触正文打开阅读菜单",
             readingProgress = visibleLocator?.locations?.totalProgression?.toFloat(),
             controlsVisible = showReadingControls,
             hasAudio = activeBook,
@@ -1049,9 +1036,24 @@ class ReaderActivity : FragmentActivity() {
                         ?: TtsVoiceUiState(),
                     onLoadVoices = { PlaybackHub.loadVoices(this, bookId, voiceLanguage) },
                     onSelectVoice = { PlaybackHub.selectVoice(this, bookId, voiceLanguage, it) },
+                    onPreviousChapter = { skipListeningChapter(forward = false) },
+                    onNextChapter = { skipListeningChapter(forward = true) },
                 )
             }
         }
+    }
+
+    private fun skipListeningChapter(forward: Boolean) {
+        val audio = PlaybackHub.state.value
+        if (audio.bookId != bookId ||
+            !(if (forward) audio.canGoToNextChapter else audio.canGoToPreviousChapter)) return
+        // An explicit audio chapter choice supersedes a pending selection/page lookup.
+        cancelReadingStart()
+        resumableProgress = null
+        pendingStoppedProgress = null
+        requestedReadingStart = null
+        readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
+        if (forward) PlaybackHub.nextChapter(this, bookId) else PlaybackHub.previousChapter(this, bookId)
     }
 
     private fun toggleListening() {

@@ -2,6 +2,7 @@ package com.freereading.audio
 
 import com.freereading.data.SpeechSentence
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -13,6 +14,67 @@ class ChapterProgressTest {
     private fun unequalSentences() = ChapterProgressIndex(listOf(
         sentence(0, "甲"), sentence(1, "乙".repeat(9)),
     ))
+
+    @Test fun chapterCommandsTargetAdjacentStartsFromEveryPositionWithinAChapter() {
+        val chapters = listOf(0, 0, 0, 5, 5, 8, 8, 8)
+        val progress = ChapterProgressIndex(chapters.mapIndexed { index, chapter -> sentence(index, "正文", chapter) })
+        val previous = listOf(null, null, null, 0, 0, 3, 3, 3)
+        val next = listOf(3, 3, 3, 5, 5, null, null, null)
+
+        for (index in chapters.indices) {
+            assertEquals("previous at $index", previous[index], progress.previousChapterStart(index))
+            assertEquals("next at $index", next[index], progress.nextChapterStart(index))
+        }
+    }
+
+    @Test fun aSingleChapterHasNoAdjacentChapterEvenWhenItContainsSeveralSentences() {
+        val progress = ChapterProgressIndex(List(3) { sentence(it, "正文", 4) })
+
+        for (index in 0..2) {
+            assertNull(progress.previousChapterStart(index))
+            assertNull(progress.nextChapterStart(index))
+        }
+    }
+
+    @Test fun skippedResourceNumbersDoNotCreateEmptyChapterStops() {
+        val progress = ChapterProgressIndex(listOf(sentence(0, "甲", 2), sentence(1, "乙", 9),
+            sentence(2, "丙", 9), sentence(3, "丁", 40)))
+
+        assertEquals(1, progress.nextChapterStart(0))
+        assertEquals(3, progress.nextChapterStart(1))
+        assertEquals(0, progress.previousChapterStart(2))
+        assertEquals(1, progress.previousChapterStart(3))
+    }
+
+    @Test fun repeatedResourceIdsInSeparateRunsRemainSeparateChapterStops() {
+        val progress = ChapterProgressIndex(listOf(sentence(0, "甲", 2), sentence(1, "乙", 2),
+            sentence(2, "丙", 5), sentence(3, "丁", 2), sentence(4, "戊", 2)))
+
+        assertEquals(2, progress.nextChapterStart(0))
+        assertEquals(3, progress.nextChapterStart(2))
+        assertEquals(2, progress.previousChapterStart(4))
+        assertNull(progress.nextChapterStart(4))
+    }
+
+    @Test fun chapterNavigationUsesTheBuiltIndexAfterTheInputListIsReleased() {
+        val sentences = mutableListOf(sentence(0, "甲", 0), sentence(1, "乙", 4), sentence(2, "丙", 4))
+        val progress = ChapterProgressIndex(sentences)
+        sentences.clear()
+
+        assertEquals(1, progress.nextChapterStart(0))
+        assertEquals(0, progress.previousChapterStart(2))
+    }
+
+    @Test fun chapterNavigationRejectsEmptyBooksAndOutOfBoundsSentenceIndices() {
+        val empty = ChapterProgressIndex(emptyList())
+        assertThrows(IllegalArgumentException::class.java) { empty.previousChapterStart(0) }
+        assertThrows(IllegalArgumentException::class.java) { empty.nextChapterStart(0) }
+        val progress = unequalSentences()
+        for (index in listOf(Int.MIN_VALUE, -1, 2, Int.MAX_VALUE)) {
+            assertThrows(IllegalArgumentException::class.java) { progress.previousChapterStart(index) }
+            assertThrows(IllegalArgumentException::class.java) { progress.nextChapterStart(index) }
+        }
+    }
 
     @Test fun progressWeightsBodyTextRatherThanGivingEverySentenceTheSameWeight() {
         val progress = unequalSentences()

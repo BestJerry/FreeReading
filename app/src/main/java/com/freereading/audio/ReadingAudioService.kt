@@ -202,6 +202,8 @@ class ReadingAudioService : MediaSessionService() {
             }
             ACTION_NEXT -> moveRelative(1)
             ACTION_PREVIOUS -> moveRelative(-1)
+            ACTION_NEXT_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), 1)
+            ACTION_PREVIOUS_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), -1)
             ACTION_STOP -> stopPlayback()
             ACTION_LOAD_VOICES, ACTION_SELECT_VOICE -> handleVoiceRequest(intent)
             else -> return super.onStartCommand(intent, flags, startId)
@@ -346,7 +348,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
-    private fun moveTo(index: Int, positionMs: Long) {
+    private fun moveTo(index: Int, positionMs: Long, startPlaying: Boolean = false) {
         val currentBook = book ?: return
         relativeSeeks.clear()
         val progress = captureProgress()
@@ -354,7 +356,7 @@ class ReadingAudioService : MediaSessionService() {
         // Publish absolute navigation before any persistence/synthesis suspension, so the
         // next button press advances from this requested sentence rather than the old one.
         publishPreparing(currentBook, target, positionMs)
-        beginTransition { token ->
+        beginTransition(playWhenReady = if (startPlaying) true else null) { token ->
             progress?.let { persist(it) }
             openSentence(currentBook, target, positionMs, token)
         }
@@ -386,6 +388,15 @@ class ReadingAudioService : MediaSessionService() {
         if (target in currentBook.sentences.indices) moveTo(target, 0)
     }
 
+    private fun moveChapter(requestedBookId: String?, delta: Int) {
+        val currentBook = book ?: return
+        if (requestedBookId != currentBook.book.id) return
+        val chapters = chapterProgressIndex ?: return
+        val index = currentIndex().coerceIn(currentBook.sentences.indices)
+        val target = if (delta < 0) chapters.previousChapterStart(index) else chapters.nextChapterStart(index)
+        if (target != null) moveTo(target, 0, startPlaying = true)
+    }
+
     private fun requestPlayback(play: Boolean) {
         player.playWhenReady = play
         if (!play) { refreshSnapshot(); saveCurrentLater(); return }
@@ -404,7 +415,8 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     /** Cancels and joins both workers before the next generation may touch TTS or the queue. */
-    private fun beginTransition(voiceRequestId: String? = null, block: suspend (Long) -> Unit) {
+    private fun beginTransition(voiceRequestId: String? = null, playWhenReady: Boolean? = null,
+                                block: suspend (Long) -> Unit) {
         val oldOperation = operation
         val oldPrefetch = prefetch
         val pendingVoiceLookup = voiceLookup
@@ -424,6 +436,8 @@ class ReadingAudioService : MediaSessionService() {
             error = null, needsVoiceData = false))
         player.stop()
         player.clearMediaItems()
+        // Chapter buttons request playback now; later pause commands remain authoritative.
+        if (playWhenReady != null) player.playWhenReady = playWhenReady
         try { showPreparingNotification() }
         catch (_: RuntimeException) {
             reportFailure(AudioFailure(getString(R.string.audio_start_failed)))
@@ -533,6 +547,8 @@ class ReadingAudioService : MediaSessionService() {
             positionMs = position, durationMs = duration,
             chapterProgress = chapter?.fraction ?: 0f,
             chapterSentenceCount = chapter?.sentenceCount ?: 0,
+            canGoToPreviousChapter = chapterProgressIndex?.previousChapterStart(index) != null,
+            canGoToNextChapter = chapterProgressIndex?.nextChapterStart(index) != null,
             isPlaying = player.isPlaying, isPreparing = player.playbackState == Player.STATE_BUFFERING,
             speed = player.playbackParameters.speed))
     }
@@ -547,6 +563,8 @@ class ReadingAudioService : MediaSessionService() {
             text = sentence.text, positionMs = positionMs.coerceAtLeast(0), durationMs = duration,
             chapterProgress = chapter?.fraction ?: 0f,
             chapterSentenceCount = chapter?.sentenceCount ?: 0,
+            canGoToPreviousChapter = chapterProgressIndex?.previousChapterStart(index) != null,
+            canGoToNextChapter = chapterProgressIndex?.nextChapterStart(index) != null,
             isPreparing = true, isPlaying = false, error = null, needsVoiceData = false))
     }
 
@@ -593,7 +611,8 @@ class ReadingAudioService : MediaSessionService() {
         val token = ++generation
         transitionToken = token
         book = null
-        PlaybackHub.publish(PlaybackHub.state.value.copy(isPlaying = false, isPreparing = false))
+        PlaybackHub.publish(PlaybackHub.state.value.copy(isPlaying = false, isPreparing = false,
+            canGoToPreviousChapter = false, canGoToNextChapter = false))
         player.pause()
         player.stop()
         player.clearMediaItems()
@@ -704,11 +723,14 @@ class ReadingAudioService : MediaSessionService() {
         internal const val ACTION_SPEED = "com.freereading.audio.SPEED"
         internal const val ACTION_NEXT = "com.freereading.audio.NEXT"
         internal const val ACTION_PREVIOUS = "com.freereading.audio.PREVIOUS"
+        internal const val ACTION_NEXT_CHAPTER = "com.freereading.audio.NEXT_CHAPTER"
+        internal const val ACTION_PREVIOUS_CHAPTER = "com.freereading.audio.PREVIOUS_CHAPTER"
         internal const val ACTION_STOP = "com.freereading.audio.STOP"
         internal const val ACTION_LOAD_VOICES = "com.freereading.audio.LOAD_VOICES"
         internal const val ACTION_SELECT_VOICE = "com.freereading.audio.SELECT_VOICE"
         private val PRIVATE_ACTIONS = setOf(ACTION_PLAY_BOOK, ACTION_TOGGLE, ACTION_SEEK_BY,
-            ACTION_SPEED, ACTION_NEXT, ACTION_PREVIOUS, ACTION_STOP, ACTION_LOAD_VOICES, ACTION_SELECT_VOICE)
+            ACTION_SPEED, ACTION_NEXT, ACTION_PREVIOUS, ACTION_NEXT_CHAPTER, ACTION_PREVIOUS_CHAPTER,
+            ACTION_STOP, ACTION_LOAD_VOICES, ACTION_SELECT_VOICE)
         internal const val EXTRA_BOOK_ID = "book_id"
         internal const val EXTRA_INDEX = "sentence_index"
         internal const val EXTRA_POSITION = "position_ms"

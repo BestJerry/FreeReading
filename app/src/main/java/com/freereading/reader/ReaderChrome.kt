@@ -92,7 +92,7 @@ internal fun ReaderChrome(
     }
 
     // Do not add a background, clickable or pointerInput here: the empty middle must let
-    // the underlying Readium view receive page turns, center taps and text selection.
+    // the underlying Readium view receive swipes, menu taps and text selection.
     Box(modifier.fillMaxSize().testTag("reader_chrome")) {
         if (controlsVisible) {
             Row(
