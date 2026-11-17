@@ -9,13 +9,17 @@ import org.jsoup.select.NodeFilter
 import org.jsoup.select.NodeTraversor
 import org.jsoup.select.Selector
 
+/** 原文定位的明确依据：CSS 元素、目录锚点或显式的资源起点。 */
 internal sealed interface SourceSpeechAnchor {
+    /** Readium 提供的可见元素选择器。 */
     data class Element(val selector: String) : SourceSpeechAnchor
+    /** EPUB 内部链接或目录指向的元素 ID。 */
     data class Fragment(val id: String) : SourceSpeechAnchor
+    /** 用户明确选择无锚点目录项时，从该资源的第一句开始。 */
     data object ResourceStart : SourceSpeechAnchor
 }
 
-/** Resolves only within the original XHTML resource supplied by the caller. */
+/** 解析调用方提供的单个原始 XHTML，结合 DOM 顺序定位目录边界或可朗读句子。 */
 internal class SourceSentenceResolver(html: String) {
     private val document = Jsoup.parse(html.withoutLeadingHtmlBom())
     private val elements = document.getAllElements().toList()
@@ -24,7 +28,7 @@ internal class SourceSentenceResolver(html: String) {
     }
     private val selectors = HashMap<String, Element?>()
 
-    /** Finds the last TOC boundary before a visible element, within this resource only. */
+    /** 仅在当前资源内找到可见元素之前最近的目录边界；重复 ID 不作为可靠证据。 */
     @Synchronized
     fun resolveContents(entries: List<Pair<Int, String?>>, anchor: SourceSpeechAnchor): Int? {
         val resourceStart = entries.lastOrNull { it.second == null }?.first
@@ -34,7 +38,7 @@ internal class SourceSentenceResolver(html: String) {
             is SourceSpeechAnchor.Fragment -> elements.filter { it.id() == anchor.id }.singleOrNull()
             SourceSpeechAnchor.ResourceStart -> null
         } ?: return null
-        // A whole-document selector does not identify the currently visible chapter.
+        // 整份文档级选择器无法证明当前可见章节，不能据此选中目录项。
         if (target.normalName() in setOf("html", "body")) return null
         val targetOrder = documentOrder[target] ?: return null
         val visibleStartOrder = if (anchor is SourceSpeechAnchor.Element) {
@@ -53,7 +57,7 @@ internal class SourceSentenceResolver(html: String) {
         }.maxWithOrNull(compareBy<Pair<Int, Int>> { it.second }.thenBy { it.first })?.first ?: resourceStart
     }
 
-    /** Empty inline anchors before a heading's first text belong to that visible heading. */
+    /** 标题首段文字之前的空行内锚点属于该标题，定位目录时一并越过这些前置标记。 */
     private fun contentsTextStartOrder(target: Element, targetOrder: Int): Int {
         var leadingOrder = targetOrder
         var hasText = false
@@ -66,10 +70,11 @@ internal class SourceSentenceResolver(html: String) {
                 NodeFilter.FilterResult.CONTINUE
             }
         }, target)
-        // A textless container does not prove that its later descendants are already visible.
+        // 无文本容器不能证明其后代已经可见，不能据此提前进入后面的章节。
         return if (hasText) leadingOrder else targetOrder
     }
 
+    /** 优先返回目标所属索引文本块或子树内的首句；没有可读句时向后查找，歧义或失效锚点不回退章首。 */
     @Synchronized
     fun resolve(candidates: List<SentenceLocatorMatcher.Anchor>, anchor: SourceSpeechAnchor): Int? {
         if (anchor == SourceSpeechAnchor.ResourceStart) return candidates.minOfOrNull { it.index }
@@ -86,8 +91,8 @@ internal class SourceSentenceResolver(html: String) {
         }
         if (resolved.isEmpty()) return null
 
-        // An inline marker belongs to its nearest indexed text block. A structural wrapper
-        // without its own indexed text must not rewind a fragment to preceding child paragraphs.
+        // 行内标记归属最近的已索引文本块；没有自身正文索引的结构容器
+        // 不能把片段起点回退到前面的子段落。
         val parentBlock = target.parents().firstOrNull { it.isBlock }
         val scope = if (!target.isBlock && (anchor is SourceSpeechAnchor.Fragment || target.hasText()) &&
             parentBlock != null &&
@@ -102,31 +107,31 @@ internal class SourceSentenceResolver(html: String) {
         val inside = resolved.filter { it.element.isWithin(scope) }
         if (inside.isNotEmpty()) return inside.minOf { it.index }
 
-        // Readium can give text before and after a divider the same ancestor selector. Without
-        // a text-node range, neither rewinding that ancestor nor skipping it is justified.
+        // 分隔符前后的文字可能被 Readium 赋予同一祖先选择器；
+        // 缺少文本节点范围时，无法确定应从祖先开头读还是越过它，因此返回未匹配。
         if (target.isBlock && resolved.any {
                 it.element.isBlock && it.element !== target && target.isWithin(it.element)
             }
         ) return null
 
-        // Empty blocks, dividers and images have no speech sentence. Only DOM elements after
-        // this real target are eligible; a missing target has already returned null above.
+        // 空块、分隔符和图片没有朗读句子，只能查找真实目标之后的元素；
+        // 目标不存在时已在前面返回 null，不允许用后续正文掩盖失效锚点。
         val targetOrder = documentOrder[scope] ?: return null
         return resolved.asSequence()
             .filter { (documentOrder[it.element] ?: -1) > targetOrder }
-            // Sentence indices already follow Readium's source traversal, including text in
-            // nested blocks and several sentences sharing the same selector.
+            // 句子编号已遵循 Readium 原文遍历顺序，包含嵌套块和共用选择器的多个句子。
             .minOfOrNull { it.index }
     }
 
+    /** 只接受唯一命中的元素并缓存查询结果；非法或歧义选择器都视为未匹配。 */
     private fun uniqueElement(selector: String): Element? {
         if (selector.isBlank()) return null
         if (selectors.containsKey(selector)) return selectors[selector]
         val element = try {
             val attribute = QUOTED_ATTRIBUTE.matchEntire(selector)
             if (attribute != null) {
-                // Jsoup 1.18.1 does not CSS-unescape quoted attribute values. Interpret only
-                // this complete selector form; never rewrite escaped identifiers or combinators.
+                // Jsoup 1.18.1 不会对带引号的属性值做 CSS 反转义，
+                // 只补充处理完整的属性选择器，不改写标识符转义或组合选择器。
                 val value = decodeCssString(attribute.groupValues[3], attribute.groupValues[2][0])
                 val key = attribute.groupValues[1]
                 if (value == null) null else elements.filter {
@@ -144,6 +149,7 @@ internal class SourceSentenceResolver(html: String) {
         return element
     }
 
+    /** 解码 CSS 字符串转义；不完整转义或禁用字符返回 null，非法转义码点替换为 U+FFFD。 */
     private fun decodeCssString(raw: String, quote: Char): String? {
         val decoded = StringBuilder()
         var offset = 0
@@ -185,6 +191,7 @@ internal class SourceSentenceResolver(html: String) {
         return false
     }
 
+    /** 将全书句子编号与本资源中唯一匹配的 DOM 元素关联。 */
     private data class IndexedElement(val index: Int, val element: Element)
 
     private companion object {

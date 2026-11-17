@@ -5,14 +5,15 @@ import com.freereading.data.SpeechSource
 import org.json.JSONObject
 import org.readium.r2.shared.publication.Locator
 
-/** Compact matching evidence only; navigation continues to use each sentence's full locator. */
+/** 构建轻量句子匹配证据；实际跳页仍使用句子的完整定位信息。 */
 internal object SpeechSentenceAnchors {
     private const val CONTEXT_LENGTH = 160
     private val whitespace = Regex("\\s+")
 
+    /** 兼容旧版完整定位与新版共享原段落索引，按需提取匹配上下文以控制大章内存。 */
     fun build(sentences: Sequence<SpeechSentence>): List<SentenceLocatorMatcher.Anchor> = buildList {
-        // Even 160-character snapshots per sentence can exceed the heap for a large chapter.
-        // Keep ranges here and build only the source context currently requested by the matcher.
+        // 大章中即使每句只复制 160 字上下文也可能耗尽堆内存，
+        // 因此保留句子范围，仅为匹配器当前访问的原段落构建上下文。
         val provider = ContextProvider()
         for (sentence in sentences) {
             val source = sentence.source
@@ -38,6 +39,7 @@ internal object SpeechSentenceAnchors {
         }
     }
 
+    /** 将句子范围适配为延迟文本访问，避免提前复制前后文。 */
     private class RangeText(
         private val sentence: SpeechSentence,
         private val provider: ContextProvider,
@@ -47,6 +49,7 @@ internal object SpeechSentenceAnchors {
         override val after: String get() = provider.context(requireNotNull(sentence.source)).after(sentence)
     }
 
+    /** 只缓存最近访问的原段落，连续匹配共享段落的句子时可复用规范化结果。 */
     private class ContextProvider {
         private var current: Pair<SpeechSource, SourceContext>? = null
 
@@ -57,6 +60,7 @@ internal object SpeechSentenceAnchors {
         }
     }
 
+    /** 原段落规范化结果及偏移映射，让句子的 UTF-16 范围仍能对应到压缩空白后的上下文。 */
     private class SourceContext(private val source: SpeechSource) {
         private val beforeLength = source.locator.text.before.orEmpty().length
         private val length = beforeLength + source.text.length + source.locator.text.after.orEmpty().length
@@ -67,8 +71,8 @@ internal object SpeechSentenceAnchors {
         private val contentEnd: Int
 
         init {
-            // Normalize once per source, not once per sentence. Using the actual Regex also
-            // preserves Android/JVM differences in the Unicode characters matched by \\s.
+            // 同一原段落的连续访问复用规范化结果；使用同一个实际正则匹配空白，
+            // 保持 Android 与 JVM 对 Unicode 空白字符处理的各自一致性。
             val raw = source.locator.text.before.orEmpty() + source.text + source.locator.text.after.orEmpty()
             val regexWhitespace = BooleanArray(length)
             for (match in whitespace.findAll(raw)) {
@@ -113,8 +117,8 @@ internal object SpeechSentenceAnchors {
     private fun beforeWindow(normalized: String, start: Int, end: Int): String {
         if (end <= start) return ""
         val window = normalized.substring(maxOf(start, end - CONTEXT_LENGTH), end)
-        // Matcher normalizes/trims again before takeLast(160). Keep a boundary whitespace inside
-        // that window; this extra character is discarded and never becomes navigation text.
+        // 匹配器会再次规范化并裁剪空白，再取最后 160 字；用占位符保护窗口边界空白，
+        // 该额外字符之后会被截掉，不会进入真实导航文本。
         return if (window.first().isWhitespace()) "x$window" else window
     }
 

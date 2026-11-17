@@ -1,6 +1,6 @@
 package com.freereading.data
 
-/** Shared in-memory and on-disk bounds; shared source contexts are counted only once. */
+/** 内存与磁盘索引共用的容量边界；同源句子共享的定位上下文只计一次。 */
 internal object SpeechIndexLimits {
     const val MAX_SENTENCES: Int = 500_000
     const val MAX_TEXT_CHARACTERS: Long = 20_000_000L

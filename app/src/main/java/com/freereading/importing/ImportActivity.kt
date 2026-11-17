@@ -43,9 +43,11 @@ import com.freereading.ui.Forest
 import com.freereading.ui.FreeReadingTheme
 import kotlinx.coroutines.launch
 
+/** 接收文件管理器打开或分享的 EPUB，展示导入进度，并在成功后进入阅读页。 */
 class ImportActivity : ComponentActivity() {
     private val model: ExternalImportViewModel by viewModels()
 
+    /** 仅在 ViewModel 尚未受理请求时提交来源；在 RESUMED 时消费导航结果，避免重复处理。 */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -106,6 +108,7 @@ class ImportActivity : ComponentActivity() {
         }
     }
 
+    /** 复用当前 Activity 接收外部请求；同源重复请求复用任务，更换来源时取消旧导入。 */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

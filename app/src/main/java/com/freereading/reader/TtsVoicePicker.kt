@@ -37,7 +37,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.freereading.audio.TtsVoiceUiState
 import java.util.Locale
 
-/** The selected radio follows the confirmed catalog, including while a change is in progress. */
+/** 展示系统离线音色；切换期间仍按服务确认的音色目录标记选中项，避免提前显示成功。 */
 @Composable
 internal fun TtsVoicePicker(
     state: TtsVoiceUiState,
@@ -51,7 +51,7 @@ internal fun TtsVoicePicker(
 ) {
     val muted = ink.copy(alpha = 0.62f)
     val catalog = state.catalog
-    // Some engines reuse a voice name; each list key must still be unique.
+    // 部分引擎会返回重复音色，按 ID 去重以保证列表 key 唯一。
     val voices = catalog?.voices.orEmpty().distinctBy { it.id }
     val busy = state.loading || state.switching
     val effectiveVoice = catalog?.voices?.firstOrNull { it.id == catalog.effectiveVoiceId }
@@ -128,6 +128,7 @@ internal fun TtsVoicePicker(
     }
 }
 
+/** 将整行作为单选热区；内部单选钮共享选中与禁用状态，避免重复点击入口。 */
 @Composable
 private fun VoiceChoiceRow(
     title: String,

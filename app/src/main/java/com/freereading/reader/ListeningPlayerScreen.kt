@@ -83,7 +83,10 @@ import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-/** Presentation only: closing this surface leaves the reader and the playback service intact. */
+/**
+ * 独立听书界面只展示状态并上报操作，关闭界面不会销毁阅读页或停止播放服务。
+ * 已有音频会话的控制不依赖正文是否加载完毕；需要阅读定位的操作单独受 enabled 限制。
+ */
 @Composable
 internal fun ListeningPlayerScreen(
     bookTitle: String,
@@ -300,6 +303,7 @@ internal fun ListeningPlayerScreen(
     }
 }
 
+/** 章节跳转按钮使用独立回调与边界状态，与前后 15 秒跳转分别处理。 */
 @Composable
 private fun ListeningChapterButton(
     icon: ImageVector,
@@ -330,6 +334,7 @@ private fun ListeningSeekButton(icon: ImageVector, description: String, enabled:
     }
 }
 
+/** 优先展示本地封面；无封面时使用书名绘制占位，保持播放器布局稳定。 */
 @Composable
 private fun ListeningCover(title: String, coverPath: String?, paper: Color, ink: Color, accent: Color, modifier: Modifier) {
     val cover by produceState<ImageBitmap?>(null, coverPath) {

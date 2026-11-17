@@ -28,12 +28,14 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
+/** 可直接呈现给用户的听书异常；needsVoiceData 指示是否提供系统语音设置入口。 */
 internal class AudioFailure(val userMessage: String, val needsVoiceData: Boolean = false) :
     Exception(userMessage)
 
+/** 已校验的句子音频文件及真实毫秒时长，供播放器和跨句跳转共用。 */
 internal data class SynthesizedSentence(val file: File, val durationMs: Long)
 
-/** Only this class touches TTS. A mutex bounds synthesis to one request and one WAV buffer. */
+/** 系统 TTS 与离线音频缓存的唯一访问层；互斥锁确保同一时刻只有一个合成请求和 WAV 缓冲。 */
 internal class OfflineSpeechCache(private val context: Context) {
     private val root = File(context.cacheDir, "speech")
     private val mutex = Mutex()
@@ -49,14 +51,15 @@ internal class OfflineSpeechCache(private val context: Context) {
     @Volatile private var protectedPaths: Set<String> = emptySet()
     @Volatile private var closed = false
 
+    /** 标记播放队列仍在使用的文件，缓存回收时必须保留这些音频。 */
     fun protect(files: Collection<File>) { protectedPaths = files.map { it.absolutePath }.toSet() }
 
-    /** Lists the default engine without changing the voice of an in-flight synthesis request. */
+    /** 枚举默认引擎的可用离线音色，不改变正在合成的请求使用的音色。 */
     suspend fun voices(language: String): TtsVoiceCatalog = withContext(Dispatchers.IO) {
         mutex.withLock { readVoiceCatalog(language).catalog }
     }
 
-    /** Call after cancelling synthesis/prefetch; the same mutex also protects preference changes. */
+    /** 由调用方取消合成／预取后再切换；同一互斥锁也保护音色偏好的修改。 */
     suspend fun selectVoice(language: String, voiceId: String?): TtsVoiceCatalog = withContext(Dispatchers.IO) {
         mutex.withLock {
             val state = readVoiceCatalog(language)
@@ -68,6 +71,10 @@ internal class OfflineSpeechCache(private val context: Context) {
         }
     }
 
+    /**
+     * 取得指定句子的真实音频：优先复用校验通过的缓存，未命中则串行合成为临时文件后重命名。
+     * 缓存键包含引擎、版本、音色和文本；finally 中尝试删除临时文件，避免将未提交文件用作音频。
+     */
     suspend fun ensure(bookId: String, sentence: SpeechSentence, language: String): SynthesizedSentence =
         withContext(Dispatchers.IO) {
             mutex.withLock {
@@ -110,10 +117,11 @@ internal class OfflineSpeechCache(private val context: Context) {
             }
         }
 
+    /** 由主线程调用，初始化并验证默认引擎和回调；默认引擎变化时重新绑定，连接失败则释放并报错。 */
     private suspend fun readyEngine(): TextToSpeech {
         if (closed) throw CancellationException("Speech cache closed")
-        // Android settings can replace the default engine while this service stays alive.
-        // Reinitialize before enumerating; voices from the previous engine must not be relabelled.
+        // 服务存活期间，用户仍可在系统设置中更换默认引擎。
+        // 枚举前重新初始化，不能把旧引擎的音色标成新引擎提供的音色。
         if (engine != null && engine!!.defaultEngine.orEmpty() != configuredEnginePackage) resetEngine()
         if (engine == null) {
             val ready = CompletableDeferred<Int>()
@@ -174,6 +182,7 @@ internal class OfflineSpeechCache(private val context: Context) {
         return speech
     }
 
+    /** 一次音色查询对应的引擎、语言与目录，避免选择过程混用不同引擎的信息。 */
     private data class VoiceCatalogState(
         val speech: TextToSpeech,
         val locale: Locale,
@@ -181,7 +190,7 @@ internal class OfflineSpeechCache(private val context: Context) {
         val catalog: TtsVoiceCatalog,
     )
 
-    /** Caller holds mutex; this only reads the engine, not setVoice/setLanguage. */
+    /** 调用方须持有互斥锁；仅读取引擎，不调用 setVoice／setLanguage，失效偏好回退自动选择。 */
     private suspend fun readVoiceCatalog(language: String): VoiceCatalogState =
         withContext(Dispatchers.Main.immediate) {
             val speech = readyEngine()
@@ -193,6 +202,7 @@ internal class OfflineSpeechCache(private val context: Context) {
             VoiceCatalogState(speech, locale, voices, catalog)
         }
 
+    /** 设置有效离线音色并固定合成语速为 1 倍，返回包含引擎版本的缓存标识；倍速由播放器处理。 */
     private suspend fun selectOfflineVoice(language: String): String = withContext(Dispatchers.Main.immediate) {
         val state = readVoiceCatalog(language)
         val speech = state.speech
@@ -214,6 +224,7 @@ internal class OfflineSpeechCache(private val context: Context) {
         "$engineName|$version|${voice.name}|${voice.locale.toLanguageTag()}|rate=1"
     }
 
+    /** 将系统回调转为可取消、有超时的挂起请求；请求标识保证完成回调只结束对应任务。 */
     private suspend fun synthesize(text: String, file: File) = withContext(Dispatchers.Main.immediate) {
         if (closed) throw CancellationException("Speech cache closed")
         if (text.length > TextToSpeech.getMaxSpeechInputLength()) {
@@ -232,14 +243,15 @@ internal class OfflineSpeechCache(private val context: Context) {
                 throw AudioFailure(context.getString(R.string.audio_timeout))
             }
         } finally {
-            // Keep cancellation cleanup on the same dispatcher before releasing the mutex;
-            // stopping an old request must never interrupt a newly queued request.
+            // 释放互斥锁前在同一线程完成不可取消的清理，
+            // 避免旧请求迟到的 stop() 打断刚开始的新请求。
             withContext(NonCancellable + Dispatchers.Main.immediate) {
                 if (requests.remove(id) != null) tts.stop()
             }
         }
     }
 
+    /** 按最近使用时间回收旧 WAV，保护当前文件和队列；仍超限则尝试移除本次新文件并报告错误。 */
     private fun trim(keep: File) {
         val files = root.walkTopDown().filter { it.isFile && it.extension == "wav" }.toList()
         var size = files.sumOf { it.length() }
@@ -255,7 +267,7 @@ internal class OfflineSpeechCache(private val context: Context) {
         }
     }
 
-    /** Called on the main thread; old callbacks retain only their own cancelled request IDs. */
+    /** 主线程调用：取消未完成请求并释放引擎；旧回调只能携带已失效的自身请求标识。 */
     fun resetEngine() {
         requests.values.forEach { it.cancel() }
         requests.clear()
@@ -269,16 +281,17 @@ internal class OfflineSpeechCache(private val context: Context) {
         initialized = null
         listenerInstalled = false
     }
+    /** 永久关闭该缓存实例，阻止仍在等待互斥锁的任务重新创建引擎。 */
     fun close() { closed = true; resetEngine() }
     private fun cacheFailure(): Nothing = throw AudioFailure(context.getString(R.string.audio_cache_failed))
     private fun hash(value: String) = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
     /**
-     * Older Android versions can silently bind a different engine when the default bind fails.
-     * Pin the first default-engine attempt, so fallback cannot mislabel voices or cache files.
-     * Newer Android's system TTS session reports a failed default connection through onInit(ERROR)
-     * instead; it does not call Context.bindService or silently select a different engine.
+     * 旧版 Android 在默认引擎绑定失败后可能静默改绑其他引擎，因此锁定首次尝试的默认引擎，
+     * 防止后备引擎的音色和缓存被误标为默认引擎。
+     * 新版 Android 的系统 TTS 会话通过 onInit(ERROR) 报告连接失败，
+     * 不调用 Context.bindService，也不静默切换到其他引擎。
      */
     private class DefaultEngineContext(base: Context) : ContextWrapper(base) {
         var attemptedEnginePackage: String? = null
@@ -299,6 +312,7 @@ internal class OfflineSpeechCache(private val context: Context) {
         }
     }
 
+    /** 缓存容量和引擎初始化／句子合成超时边界。 */
     private companion object {
         const val MAX_CACHE_BYTES = 256L * 1024 * 1024
         const val INIT_TIMEOUT_MS = 15_000L

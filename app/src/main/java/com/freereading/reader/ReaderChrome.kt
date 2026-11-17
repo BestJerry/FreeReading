@@ -46,7 +46,7 @@ import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-/** Overlays the full-size reader; the caller supplies system-bar insets and Readium gestures. */
+/** 绘制叠加于正文的阅读菜单和薄页脚；系统栏留白及正文手势由调用方负责。 */
 @Composable
 internal fun ReaderChrome(
     title: String,
@@ -74,7 +74,7 @@ internal fun ReaderChrome(
     val viewConfiguration = LocalViewConfiguration.current
     val footerViewConfiguration = remember(viewConfiguration) {
         object : ViewConfiguration by viewConfiguration {
-            // A thin overlay must not expand its hit area upward into the Readium page.
+            // 薄页脚的最小触摸热区不能向上扩展，否则会遮挡正文手势。
             override val minimumTouchTargetSize = DpSize(viewConfiguration.minimumTouchTargetSize.width, 0.dp)
         }
     }
@@ -91,8 +91,8 @@ internal fun ReaderChrome(
         else -> "已开启，听书已暂停"
     }
 
-    // Do not add a background, clickable or pointerInput here: the empty middle must let
-    // the underlying Readium view receive swipes, menu taps and text selection.
+    // 外层不能添加背景、clickable 或 pointerInput；中央透明区域必须让底层 Readium
+    // 接收滑动、菜单轻触和文字选择，只有实际控件区域拦截触摸。
     Box(modifier.fillMaxSize().testTag("reader_chrome")) {
         if (controlsVisible) {
             Row(
@@ -230,6 +230,7 @@ internal fun ReaderChrome(
     }
 }
 
+/** 统一阅读菜单入口的点击、加载状态和无障碍描述。 */
 @Composable
 private fun ReaderChromeMenuItem(
     label: String,

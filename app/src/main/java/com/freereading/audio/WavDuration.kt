@@ -4,8 +4,9 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 
-/** Reads WAV chunks rather than assuming the optional chunks always form a 44-byte header. */
+/** 按 WAV 数据块读取真实音频时长，兼容包含可选块、头部不固定为 44 字节的文件。 */
 internal object WavDuration {
+    /** 根据 fmt 块字节率和 data 块长度计算毫秒数；检测到缺失格式、无效字节率、空数据或越界块时抛出 IOException。 */
     fun readMs(file: File): Long = RandomAccessFile(file, "r").use { input ->
         if (input.length() < 12 || input.tag() != "RIFF") throw IOException("Invalid WAV")
         input.uint32()

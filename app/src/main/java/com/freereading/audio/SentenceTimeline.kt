@@ -1,19 +1,21 @@
 package com.freereading.audio
 
-/** positionMs is media time: speed changes do not alter the text/audio correspondence. */
+/** 句子索引与句内媒体时间；倍速不改变该时间轴上的文字和音频对应关系。 */
 internal data class SentencePosition(val index: Int, val positionMs: Long)
 
+/** 尚在准备的相对跳转：保留最初起点，并用修订号区分连续按钮操作。 */
 internal data class PendingRelativeSeek(
     val anchor: SentencePosition,
     val deltaMs: Long,
     val revision: Long,
 )
 
-/** Keeps relative button presses additive while the original seek is awaiting synthesis. */
+/** 首次跳转等待音频合成时，继续累加快进／快退按钮的位移，避免连续点击丢失。 */
 internal class RelativeSeekAccumulator {
     private var pending: PendingRelativeSeek? = null
     private var revision = 0L
 
+    /** 从同一起点累加位移并生成新修订号，将累计范围限制在正负一小时内。 */
     fun enqueue(anchor: SentencePosition, deltaMs: Long): PendingRelativeSeek {
         val previous = pending
         val total = ((previous?.deltaMs ?: 0) + deltaMs.coerceIn(-LIMIT_MS, LIMIT_MS))
@@ -21,16 +23,19 @@ internal class RelativeSeekAccumulator {
         return PendingRelativeSeek(previous?.anchor ?: anchor, total, ++revision).also { pending = it }
     }
 
+    /** 只清除最新请求，较早请求的完成回调不能抹掉后续点击。 */
     fun complete(request: PendingRelativeSeek) {
         if (pending?.revision == request.revision) pending = null
     }
 
     fun clear() { pending = null }
+    /** 限制一次累计跳转的最大媒体时间位移。 */
     private companion object { const val LIMIT_MS = 3_600_000L }
 }
 
+/** 根据真实句长在跨句音频时间轴上定位，边界处停在全书开头或结尾。 */
 internal object SentenceTimeline {
-    /** Loads real durations as needed; unknown sentences must be synthesized, never estimated. */
+    /** 按需取得每句真实时长；未知时长由调用方合成获取，不估算未生成句子的时长。 */
     suspend fun seek(
         sentenceCount: Int,
         startIndex: Int,

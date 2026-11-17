@@ -16,10 +16,14 @@ import kotlinx.coroutines.ensureActive
 import org.json.JSONObject
 import org.readium.r2.shared.publication.Locator
 
-/** v2 stores original source locators once; sentence contexts are reconstructed only on demand. */
+/**
+ * 听书索引的流式读写器，兼容 v1 并以 v2 保存共享原文片段与句子范围。
+ * 原始定位只存一次，句子上下文按需展开；完整索引读写均检查句数、字符数和文件容量。
+ */
 internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLimits.MAX_INDEX_BYTES) {
     init { require(maxIndexBytes in 1..SpeechIndexLimits.MAX_INDEX_BYTES) }
 
+    /** 校验句子与共享片段并以原子方式写入 v2 索引；确认落盘提交后才报告 100% 进度。 */
     suspend fun write(file: File, book: SpeechBook, onProgress: ((Long, Long?) -> Unit)? = null) {
         onProgress?.invoke(0, null)
         checkCount(book.sentences.size)
@@ -72,7 +76,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
                 writer.name("startOffset").value(sentence.startOffset)
                 writer.name("endOffset").value(sentence.endOffset).endObject()
                 completed += 1
-                // The last record can still be buffered or fail the byte limit during flush.
+                // 最后一条记录可能仍在缓冲区，也可能在 flush 时触发字节上限，提交前不能报告完成。
                 if (completed < total) onProgress?.invoke(completed, total)
             }
             writer.endArray().endObject()
@@ -85,6 +89,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         onProgress?.invoke(total, total)
     }
 
+    /** 流式解析完整索引并按元数据校验书籍标识、顺序和引用；拒绝混用格式或越界范围。 */
     suspend fun read(file: File, bookId: String, expectedCount: Int): List<SpeechSentence> {
         checkCount(expectedCount)
         var version = -1
@@ -189,7 +194,10 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         return sentences
     }
 
-    /** Read migration evidence without keeping the old index beside the rebuilt book in memory. */
+    /**
+     * 为进度迁移流式读取单句，避免新旧整书索引同时驻留内存。
+     * v2 先取得句子引用，再扫描取得所需原文片段，并确认版本、片段数和目标句字段未变化。
+     */
     suspend fun readSentence(file: File, bookId: String, expectedCount: Int, index: Int): SpeechSentence {
         checkCount(expectedCount)
         if (index !in 0 until expectedCount) throw IOException("Invalid sentence index")
@@ -201,8 +209,8 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
             return SpeechSentence(index, requireNotNull(fields.text), json,
                 requireNotNull(fields.chapter), fields.title.orEmpty())
         }
-        // Sources normally precede ranges in v2. Scan again after finding the source ID,
-        // retaining only that source even for a book with hundreds of thousands of sources.
+        // v2 的原文片段通常位于句子范围之前；得到片段编号后再扫描一次，
+        // 即使长书有数十万片段，也只保留目标片段。
         val second = scanSentence(file, bookId, expectedCount, index, requireNotNull(fields.sourceIndex))
         if (first.version != second.version || first.sourceCount != second.sourceCount ||
             fields != second.sentence) throw IOException("Speech index changed while reading")
@@ -218,6 +226,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         return SpeechSentence(index, source, start, end)
     }
 
+    /** 单句扫描结果；只携带目标句、可选原文片段及校验两次扫描所需的结构信息。 */
     private data class SentenceScan(
         val version: Int,
         val sourceCount: Int,
@@ -225,6 +234,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         val source: SourceFields?,
     )
 
+    /** 扫描并校验索引结构，仅保留目标句和指定片段，供单句迁移的两次扫描使用。 */
     private suspend fun scanSentence(file: File, bookId: String, expectedCount: Int, index: Int,
                                      sourceToRead: Int? = null): SentenceScan {
         var version = -1
@@ -313,6 +323,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         return SentenceScan(version, sourceCount, selected ?: throw IOException("Missing sentence"), source)
     }
 
+    /** 原文片段的序列化字段，解析后再校验定位 JSON 与内容容量。 */
     private data class SourceFields(val locatorJson: String, val chapter: Int, val title: String)
 
     private fun readSource(reader: JsonReader): SourceFields {
@@ -335,6 +346,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         return SourceFields(json ?: throw IOException("Missing source locator"), chapter, title)
     }
 
+    /** 同时承载 v1 独立文本与 v2 范围字段，调用方负责拒绝两种格式混用。 */
     private data class SentenceFields(
         var index: Int = -1, var sourceIndex: Int? = null, var start: Int? = null, var end: Int? = null,
         var text: String? = null, var locatorJson: String? = null, var chapter: Int? = null, var title: String? = null,
@@ -363,6 +375,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         return result
     }
 
+    /** 将旧格式独立句子转换为可写入 v2 的原文片段，保留章节和定位上下文。 */
     private fun legacySource(sentence: SpeechSentence): SpeechSource {
         val locator = parseLocator(sentence.locatorJson)
         return SpeechSource(locator.copy(text = locator.text.copy(highlight = sentence.text)),
@@ -380,6 +393,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
             source.text.length > SpeechIndexLimits.MAX_BLOCK_CHARACTERS) throw IOException("Invalid speech source")
     }
 
+    /** 确保句子范围非空、不超过单句长度上限，且不会从 UTF-16 代理对中间截断。 */
     private fun validateRange(source: SpeechSource, start: Int, end: Int) {
         if (start < 0 || end <= start || end > source.text.length || end - start > 500 ||
             !isBoundary(source.text, start) || !isBoundary(source.text, end) ||
@@ -401,6 +415,7 @@ internal class SpeechIndexStore(private val maxIndexBytes: Long = SpeechIndexLim
         if (count > SpeechIndexLimits.MAX_SOURCE_LOCATOR_CHARACTERS) throw BookImportException("书籍原文位置索引超过可支持的容量")
     }
 
+    /** 包装实际输出流，按已写字节数执行磁盘索引上限，超限抛错以触发原子回滚。 */
     private class LimitedOutput(private val output: OutputStream, private val limit: Long) : OutputStream() {
         private var count = 0L
         override fun write(value: Int) {

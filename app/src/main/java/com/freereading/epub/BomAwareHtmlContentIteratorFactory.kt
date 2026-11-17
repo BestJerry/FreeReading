@@ -13,10 +13,11 @@ import org.readium.r2.shared.util.mediatype.MediaType
 import org.readium.r2.shared.util.resource.Resource
 import org.readium.r2.shared.util.resource.map
 
-/** Normalize only the content iterator's read, leaving the navigator and original EPUB untouched. */
+/** 只规范化正文迭代器读取到的 HTML BOM，保持导航器和原始 EPUB 文件不变。 */
 internal class BomAwareHtmlContentIteratorFactory : ResourceContentIteratorFactory {
     private val delegate = HtmlResourceContentIterator.Factory()
 
+    /** 仅接管 HTML／XHTML；移除开头的 UTF-8 BOM 后交由 Readium 的标准迭代器解析。 */
     override suspend fun create(
         manifest: Manifest,
         servicesHolder: PublicationServicesHolder,

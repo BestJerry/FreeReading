@@ -43,6 +43,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+/**
+ * 独立于阅读页面的后台听书服务，统一持有播放器、媒体会话、TTS 缓存及进度保存任务。
+ * 播放操作在主线程串行协调；每次跳转递增 generation，旧合成／预取完成后不得覆盖新目标。
+ */
 @UnstableApi
 class ReadingAudioService : MediaSessionService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -52,6 +56,7 @@ class ReadingAudioService : MediaSessionService() {
     private lateinit var speech: OfflineSpeechCache
     private var book: SpeechBook? = null
     private var chapterProgressIndex: ChapterProgressIndex? = null
+    // generation 标识当前有效操作；transitionToken 非空时，界面快照保留的是待播放目标。
     private var generation = 0L
     private var transitionToken: Long? = null
     private var operation: Job? = null
@@ -70,6 +75,7 @@ class ReadingAudioService : MediaSessionService() {
     private val saveSequence = AtomicLong()
     private val latestSave = ConcurrentHashMap<String, Long>()
 
+    /** 初始化播放器与系统媒体控制，将通知栏／耳机操作接入同一播放策略，并定期发布和保存进度。 */
     override fun onCreate() {
         super.onCreate()
         speech = OfflineSpeechCache(applicationContext)
@@ -156,15 +162,17 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 仅向系统信任的控制器或本应用提供媒体会话。 */
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
         if (controllerInfo.isTrusted || controllerInfo.packageName == packageName) session else null
 
+    /** 验证应用私有命令，再分发起播、跳转和音色请求；系统媒体 Intent 交由 Media3 处理。 */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStartId = startId
         if (intent != null) {
             val action = intent.action
             if (action != null && action in PRIVATE_ACTIONS && !PlaybackHub.isAuthorizedCommand(intent)) {
-                // Reject app-only commands without disturbing an existing playback session.
+                // 拒绝伪造的应用私有命令，同时保留已经存在的播放会话。
                 if (book == null && transitionToken == null && player.mediaItemCount == 0) stopSelf(startId)
                 return START_NOT_STICKY
             }
@@ -173,8 +181,8 @@ class ReadingAudioService : MediaSessionService() {
             ACTION_PLAY_BOOK -> {
                 val id = intent.getStringExtra(EXTRA_BOOK_ID)
                 val requestId = intent.getStringExtra(EXTRA_PLAYBACK_SESSION_ID)
-                // startForegroundService's deadline includes EPUB parsing and TTS initialization.
-                // Fulfil it before launching either operation.
+                // 前台服务启动时限也包含 EPUB 解析和 TTS 初始化耗时，
+                // 必须在启动这两个耗时操作之前先显示前台通知。
                 try { showPreparingNotification() }
                 catch (_: RuntimeException) {
                     val old = PlaybackHub.state.value
@@ -211,11 +219,15 @@ class ReadingAudioService : MediaSessionService() {
         return START_NOT_STICKY
     }
 
+    /**
+     * 按最新请求标识处理音色查询或切换，拒绝其他书籍改变当前会话的音色。
+     * 为当前书籍切换音色时保留句内比例、播放意图和倍速；仅查询音色目录时不打断首句准备。
+     */
     private fun handleVoiceRequest(intent: Intent) {
         val id = intent.getStringExtra(EXTRA_BOOK_ID) ?: return
         val language = intent.getStringExtra(EXTRA_LANGUAGE).orEmpty()
         val requestId = intent.getStringExtra(EXTRA_VOICE_REQUEST_ID) ?: return
-        // A delayed startService intent must not replace a newer request already shown by the UI.
+        // 迟到的 startService 命令不能替换界面已展示的较新请求。
         if (PlaybackHub.voiceState.value.requestId != requestId) return
         latestVoiceRequestId = requestId
         val selecting = intent.action == ACTION_SELECT_VOICE
@@ -241,7 +253,7 @@ class ReadingAudioService : MediaSessionService() {
                 player.currentPosition.coerceAtLeast(0) else old.positionMs
             val duration = clips[index]?.durationMs ?: old.durationMs
             val fraction = if (duration > 0) (position.toDouble() / duration).coerceIn(0.0, 1.0) else null
-            // Preserve this cursor before clearMediaItems() loses the player's current item.
+            // 清空队列会丢失播放器当前项，因此先保存此处的句子游标。
             publishPreparing(currentBook, index, position)
             beginTransition(voiceRequestId = requestId) { token ->
                 val catalog = speech.selectVoice(currentBook.book.language, voiceId)
@@ -259,10 +271,10 @@ class ReadingAudioService : MediaSessionService() {
 
         val oldLookup = voiceLookup
         val oldPrefetch = prefetch
-        // Replace the guard before cancellation; an inline old finally must not restart prefetch.
+        // 取消旧任务前先替换守卫，避免旧 finally 同步执行时误重启预取。
         voiceLookupRequestId = requestId
         voiceLookupSelecting = selecting
-        // Reading a catalog must not wait for speculative sentences, nor stop initial audio.
+        // 查询音色不等待推测性的后续句合成，也不终止首句音频准备。
         oldLookup?.cancel()
         oldPrefetch?.cancel()
         val pendingOperation = operation.takeIf { transitionToken != null }
@@ -275,8 +287,8 @@ class ReadingAudioService : MediaSessionService() {
                 val catalog = if (selecting) speech.selectVoice(catalogLanguage, voiceId) else speech.voices(catalogLanguage)
                 publishVoiceResult(requestId, catalog)
             } catch (cancelled: CancellationException) {
-                // resetEngine() can cancel an initialization wait without destroying the service.
-                // A selection may already have saved its preference before Main saw its result.
+                // resetEngine() 可只取消初始化等待而不销毁服务；
+                // 主线程收到结果前，音色选择也可能已经保存，不能继续展示旧选择已确认。
                 publishVoiceResult(requestId, error = getString(R.string.audio_voice_request_interrupted),
                     clearCatalog = selecting)
                 throw cancelled
@@ -287,7 +299,7 @@ class ReadingAudioService : MediaSessionService() {
                     voiceLookupRequestId = null
                     if (!destroyed && generation == token) startPrefetch()
                     if (!destroyed && book == null && transitionToken == null && player.mediaItemCount == 0) {
-                        // A later STOP also needs cleanup; an accepted PLAY owns book/transition.
+                        // 后续 STOP 也需要清理；已接受的 PLAY 会持有书籍或切换标记，不会在此被停止。
                         stopSelf(latestStartId)
                     }
                 }
@@ -295,6 +307,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 仅向仍在等待该请求的界面发布结果，防止销毁或连续选择后的旧结果回写。 */
     private fun publishVoiceResult(requestId: String, catalog: TtsVoiceCatalog? = null,
                                    error: String? = null, clearCatalog: Boolean = false) {
         if (destroyed || latestVoiceRequestId != requestId || PlaybackHub.voiceState.value.requestId != requestId) return
@@ -306,12 +319,13 @@ class ReadingAudioService : MediaSessionService() {
     private fun voiceFailureMessage(failure: Exception): String =
         (failure as? AudioFailure)?.userMessage ?: getString(R.string.audio_voice_selection_failed)
 
+    /** 中断音色切换并结束弹窗等待；若偏好是否已保存尚不明确，则清除旧目录等待重新读取。 */
     private fun interruptVoiceSwitch(error: String = getString(R.string.audio_voice_request_interrupted)) {
         switchingVoiceRequestId?.let { requestId ->
             if (switchingVoiceCatalog == null && latestVoiceRequestId == requestId &&
                 PlaybackHub.voiceState.value.requestId == requestId) {
-                // Cancellation may arrive after IO saved the preference but before its result
-                // resumed here. Do not present the previous radio as a confirmed current choice.
+                // 取消可能发生在 IO 已保存偏好、主线程尚未收到结果之间，
+                // 不能把原来的单选项继续当作已确认的当前音色。
                 PlaybackHub.publishVoices(PlaybackHub.voiceState.value.copy(loading = false,
                     switching = false, catalog = null, error = error))
             } else publishVoiceResult(requestId, switchingVoiceCatalog, error)
@@ -320,6 +334,7 @@ class ReadingAudioService : MediaSessionService() {
         switchingVoiceCatalog = null
     }
 
+    /** 建立新的起播会话，后台读取索引；负索引恢复保存的位置，显式索引则从指定句内位置播放。 */
     private fun playBook(id: String, index: Int, offsetMs: Long,
                          playbackSessionId: String = PlaybackHub.newPlaybackSessionId()) {
         relativeSeeks.clear()
@@ -348,13 +363,14 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 跳到绝对句子位置并替换旧任务；章节按钮可明确要求开播，普通跳转保留当前播放意图。 */
     private fun moveTo(index: Int, positionMs: Long, startPlaying: Boolean = false) {
         val currentBook = book ?: return
         relativeSeeks.clear()
         val progress = captureProgress()
         val target = index.coerceIn(0, currentBook.sentences.lastIndex)
-        // Publish absolute navigation before any persistence/synthesis suspension, so the
-        // next button press advances from this requested sentence rather than the old one.
+        // 保存进度或合成音频前先发布目标，让连续点击从待播放句继续计算，
+        // 避免旧播放器位置导致每次点击都跳向同一个目标。
         publishPreparing(currentBook, target, positionMs)
         beginTransition(playWhenReady = if (startPlaying) true else null) { token ->
             progress?.let { persist(it) }
@@ -362,6 +378,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 累加相对快进／快退，并按真实句长跨句定位；缺少的音频按需合成，不使用估算时长。 */
     private fun seekBy(deltaMs: Long) {
         val currentBook = book ?: return
         val start = currentIndex()
@@ -382,12 +399,14 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 处理系统媒体的上一项／下一项，仍按句子切换并保留播放／暂停状态。 */
     private fun moveRelative(delta: Int) {
         val currentBook = book ?: return
         val target = currentIndex() + delta
         if (target in currentBook.sentences.indices) moveTo(target, 0)
     }
 
+    /** 仅允许当前书籍跳至相邻章首并播放；首末章没有目标时不重启当前音频。 */
     private fun moveChapter(requestedBookId: String?, delta: Int) {
         val currentBook = book ?: return
         if (requestedBookId != currentBook.book.id) return
@@ -397,6 +416,7 @@ class ReadingAudioService : MediaSessionService() {
         if (target != null) moveTo(target, 0, startPlaying = true)
     }
 
+    /** 记录最新播放意图；暂停立即生效，恢复时可重建失败、空队列或已结束的当前句。 */
     private fun requestPlayback(play: Boolean) {
         player.playWhenReady = play
         if (!play) { refreshSnapshot(); saveCurrentLater(); return }
@@ -414,13 +434,16 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
-    /** Cancels and joins both workers before the next generation may touch TTS or the queue. */
+    /**
+     * 建立新一代播放操作，取消旧操作与预取，等待它们及既有音色查询退出后才允许新任务合成并安装音频。
+     * 先发布切换标记并清空旧队列；其后到达的暂停命令优先于本次要求开播的初始意图。
+     */
     private fun beginTransition(voiceRequestId: String? = null, playWhenReady: Boolean? = null,
                                 block: suspend (Long) -> Unit) {
         val oldOperation = operation
         val oldPrefetch = prefetch
         val pendingVoiceLookup = voiceLookup
-        // Mark the transition before cancellation can run an old query's finally inline.
+        // 先记录切换状态，防止取消导致旧查询的 finally 立即执行并误恢复预取。
         val token = ++generation
         transitionToken = token
         if ((!voiceLookupSelecting || voiceRequestId != null) && pendingVoiceLookup?.isActive == true) {
@@ -436,7 +459,7 @@ class ReadingAudioService : MediaSessionService() {
             error = null, needsVoiceData = false))
         player.stop()
         player.clearMediaItems()
-        // Chapter buttons request playback now; later pause commands remain authoritative.
+        // 章节按钮在此请求播放，其后到达的暂停命令仍具有最终决定权。
         if (playWhenReady != null) player.playWhenReady = playWhenReady
         try { showPreparingNotification() }
         catch (_: RuntimeException) {
@@ -459,6 +482,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 合成并安装目标句；检查操作代际后才修改队列，音色切换时按新时长恢复句内比例。 */
     private suspend fun openSentence(currentBook: SpeechBook, index: Int, position: Long, token: Long,
                                      resumeFraction: Double? = null) {
         val clip = speech.ensure(currentBook.book.id, currentBook.sentences[index], currentBook.book.language)
@@ -466,7 +490,7 @@ class ReadingAudioService : MediaSessionService() {
         clips.clear()
         clips[index] = clip
         speech.protect(listOf(clip.file))
-        // Voices have different timing; only the sentence's relative position can be retained.
+        // 不同音色的时长不同，只能近似保留该句的相对播放位置。
         val resumePosition = resumeFraction?.let { (it * clip.durationMs).toLong() } ?: position
         player.setMediaItem(mediaItem(currentBook, index, clip), resumePosition.coerceIn(0, clip.durationMs))
         transitionToken = null
@@ -476,6 +500,7 @@ class ReadingAudioService : MediaSessionService() {
         startPrefetch()
     }
 
+    /** 在当前队列后少量预合成后续句；切换或音色查询期间不竞争 TTS，失败留待实际播放时重试。 */
     private fun startPrefetch() {
         val currentBook = book ?: return
         if (transitionToken != null || voiceLookupRequestId != null ||
@@ -497,12 +522,13 @@ class ReadingAudioService : MediaSessionService() {
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) {
-                // Keep existing audio playing. When playback reaches the missing sentence,
-                // openSentence retries and exposes any persistent error to the user.
+                // 预取失败不打断已有音频；真正播放到缺失句时由 openSentence 重试，
+                // 持续存在的错误届时才反馈给用户。
             }
         }
     }
 
+    /** 裁掉较早的已播媒体项，只保留当前句附近队列，并同步更新缓存文件保护范围。 */
     private fun prunePlayedQueue() {
         val current = player.currentMediaItemIndex
         if (current > 1) player.removeMediaItems(0, current - 1)
@@ -511,6 +537,7 @@ class ReadingAudioService : MediaSessionService() {
         protectQueue()
     }
 
+    /** 播放队列仍引用的文件不能被容量回收删除。 */
     private fun protectQueue() {
         val files = (0 until player.mediaItemCount).mapNotNull {
             player.getMediaItemAt(it).mediaId.toIntOrNull()?.let { index -> clips[index]?.file }
@@ -518,6 +545,7 @@ class ReadingAudioService : MediaSessionService() {
         speech.protect(files)
     }
 
+    /** 以全书句子索引作为媒体标识，附带书名、章名及封面供系统媒体控制展示。 */
     private fun mediaItem(currentBook: SpeechBook, index: Int, clip: SynthesizedSentence): MediaItem {
         val sentence = currentBook.sentences[index]
         val metadata = MediaMetadata.Builder().setTitle(currentBook.book.title)
@@ -530,10 +558,11 @@ class ReadingAudioService : MediaSessionService() {
     private fun currentIndex(): Int = player.currentMediaItem?.mediaId?.toIntOrNull()
         ?: PlaybackHub.state.value.sentenceIndex
 
+    /** 从有效媒体项刷新界面状态和正文进度；准备或失败造成的空队列不能覆盖待重试游标。 */
     private fun refreshSnapshot() {
         val currentBook = book ?: return
-        // A failed transition leaves no media item. Its zero player position is not
-        // authoritative; retain the requested cursor for retry and progress persistence.
+        // 切换失败后可能没有媒体项，此时播放器的零位置不代表实际目标，
+        // 应保留请求游标，供重试和进度保存使用。
         if (transitionToken != null || player.mediaItemCount == 0) return
         val index = currentIndex().coerceIn(0, currentBook.sentences.lastIndex)
         val sentence = currentBook.sentences[index]
@@ -553,6 +582,7 @@ class ReadingAudioService : MediaSessionService() {
             speed = player.playbackParameters.speed))
     }
 
+    /** 合成前发布目标句、位置及章节边界，让原文跟随与连续章节操作使用同一待播放游标。 */
     private fun publishPreparing(currentBook: SpeechBook, index: Int, positionMs: Long) {
         val sentence = currentBook.sentences[index]
         val duration = clips[index]?.durationMs ?: 0
@@ -568,6 +598,7 @@ class ReadingAudioService : MediaSessionService() {
             isPreparing = true, isPlaying = false, error = null, needsVoiceData = false))
     }
 
+    /** 捕获可持久化的听书位置；切换期间使用请求位置，正常播放期间读取真实句内媒体时间。 */
     private fun captureProgress(): ReadingProgress? {
         val currentBook = book ?: return null
         val index = currentIndex().coerceIn(0, currentBook.sentences.lastIndex)
@@ -579,6 +610,7 @@ class ReadingAudioService : MediaSessionService() {
         val progress = captureProgress() ?: return
         serviceScope.launch { persist(progress) }
     }
+    /** 按书籍记录最新保存序号，互斥写盘时跳过旧请求，避免异步保存把进度回退。 */
     private suspend fun persist(progress: ReadingProgress) {
         val sequence = saveSequence.incrementAndGet()
         latestSave[progress.bookId] = sequence
@@ -600,6 +632,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 立即停播并禁用章节按钮，等待旧播放／预取任务退出并尝试保存进度后才清空会话、移除前台通知。 */
     private fun stopPlayback() {
         interruptVoiceSwitch()
         relativeSeeks.clear()
@@ -632,6 +665,7 @@ class ReadingAudioService : MediaSessionService() {
         }
     }
 
+    /** 使旧任务失效并释放异常引擎，暂停音频但保留当前目标，供用户修复语音或重试。 */
     private fun reportFailure(failure: Exception) {
         interruptVoiceSwitch(voiceFailureMessage(failure))
         relativeSeeks.clear()
@@ -648,16 +682,19 @@ class ReadingAudioService : MediaSessionService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
+    /** 挂起任务恢复后同时检查协程取消和操作代际，禁止旧结果重新安装音频。 */
     private suspend fun ensureActiveGeneration(token: Long) {
         kotlinx.coroutines.currentCoroutineContext().ensureActive()
         if (token != generation) throw CancellationException("Playback generation replaced")
     }
 
+    /** 准备期间保持应用自己的前台通知，媒体已就绪时交回 Media3 更新。 */
     override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
         if (transitionToken != null) showPreparingNotification()
         else super.onUpdateNotification(session, startInForegroundRequired)
     }
 
+    /** 在解析或合成前满足媒体前台服务要求，并提供带授权令牌的停止按钮。 */
     private fun showPreparingNotification() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,
@@ -682,10 +719,12 @@ class ReadingAudioService : MediaSessionService() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
 
+    /** 划走任务时保留有播放意图或仍在切换的会话，仅在 playWhenReady 为 false 且无切换任务时停止。 */
     override fun onTaskRemoved(rootIntent: Intent?) {
         if (!player.playWhenReady && transitionToken == null) stopPlayback()
     }
 
+    /** 取消异步操作并释放 TTS、媒体会话和播放器；销毁前捕获的进度在后台尽力保存。 */
     override fun onDestroy() {
         destroyed = true
         val voiceState = PlaybackHub.voiceState.value
@@ -705,7 +744,7 @@ class ReadingAudioService : MediaSessionService() {
         PlaybackHub.serviceAlive = false
         PlaybackHub.publish(PlaybackSnapshot(speed = PlaybackHub.state.value.speed,
             startFailure = PlaybackHub.state.value.startFailure))
-        // onDestroy cannot suspend. The repository never recreates a removed book directory.
+        // onDestroy 不能挂起；后台保存仍由仓库保证不会重新创建已移除书籍的目录。
         if (progress != null) CoroutineScope(Dispatchers.IO).launch {
             storeMutex.withLock {
                 runCatching {
@@ -716,6 +755,7 @@ class ReadingAudioService : MediaSessionService() {
         super.onDestroy()
     }
 
+    /** 应用私有命令协议、媒体通知标识与预取上限。 */
     companion object {
         internal const val ACTION_PLAY_BOOK = "com.freereading.audio.PLAY_BOOK"
         internal const val ACTION_TOGGLE = "com.freereading.audio.TOGGLE"

@@ -2,13 +2,14 @@ package com.freereading.reader
 
 import com.freereading.audio.PlaybackSnapshot
 
-/** Explicit reading navigation changes the next start; merely disabling follow does not. */
+/** 区分继续听书、从新阅读位置起播和失败重试；单独关闭原文跟随不改变起播意图。 */
 internal enum class ReadingPlaybackIntent {
     CONTINUE_AUDIO,
     FROM_READING_LOCATION,
     RETRY_AUDIO_START,
 }
 
+/** 将播放按钮的界面操作归一为服务控制或阅读定位起播，避免混用两种游标。 */
 internal enum class PrimaryPlaybackAction {
     PAUSE_OR_TOGGLE,
     RESUME_AUDIO,
@@ -16,7 +17,7 @@ internal enum class PrimaryPlaybackAction {
     RESUME_SAVED_OR_READING,
 }
 
-/** The button still pauses the current book while it is playing or preparing audio. */
+/** 根据当前书籍与起播意图决定主按钮操作；本书播放或准备中时，优先允许暂停。 */
 internal fun primaryPlaybackAction(
     snapshot: PlaybackSnapshot,
     bookId: String,

@@ -10,6 +10,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
+// 书架及通用弹窗的基础色板；阅读页的纸色、夜读设置由阅读模块独立管理。
 val Paper = Color(0xFFF7F5EF)
 val Ink = Color(0xFF282D29)
 val Forest = Color(0xFF456454)
@@ -30,6 +31,7 @@ private val Colors = lightColorScheme(
     secondary = Color(0xFF9E7250),
 )
 
+/** 为应用通用界面提供纸色主题和字体层级，不干预 EPUB 正文的 Readium 排版。 */
 @Composable
 fun FreeReadingTheme(content: @Composable () -> Unit) {
     MaterialTheme(

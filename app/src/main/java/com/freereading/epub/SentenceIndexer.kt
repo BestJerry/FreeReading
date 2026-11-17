@@ -13,8 +13,12 @@ import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.publication.services.content.Content
 import org.readium.r2.shared.publication.services.content.content
 
-/** The persisted order is independent of page layout, Android ICU version and playback speed. */
+/**
+ * 从 EPUB 的阅读顺序生成确定性的听书句子索引，不依赖分页、Android ICU 版本或播放速度。
+ * 每个原文片段只保存一次定位，切出的句子记录范围，并在建立索引时执行容量边界检查。
+ */
 class SentenceIndexer {
+    /** 按正文资源遍历文本并报告资源进度；无可朗读文字、定位不一致或容量超限时拒绝索引。 */
     suspend fun index(publication: Publication, onProgress: ((Long, Long) -> Unit)? = null): List<SpeechSentence> {
         val total = publication.readingOrder.size.toLong()
         onProgress?.invoke(0, total)
@@ -37,8 +41,8 @@ class SentenceIndexer {
             if (onProgress != null) {
                 val resourceKey = nextElement.locator.href.removeFragment().removeQuery().toString()
                 val resourceIndex = chapterByHref[resourceKey]?.toLong()
-                // Entering the next resource confirms the preceding resources are exhausted,
-                // including empty chapters skipped by Readium and chapters containing only images.
+                // 进入下一个资源才确认之前的资源已遍历完成；
+                // 其中也包括 Readium 跳过的空章和纯图片章节。
                 if (resourceIndex != null && resourceIndex > completedResources) {
                     completedResources = resourceIndex
                     onProgress(completedResources, total)
@@ -52,7 +56,7 @@ class SentenceIndexer {
             }
             for (segment in element.segments) {
                 currentCoroutineContext().ensureActive()
-                // Readium's original highlight retains source whitespace and repeated text.
+                // 使用 Readium 原始 highlight，保留原文空白与重复文本，确保句子偏移对应真实内容。
                 val text = segment.locator.text.highlight ?: segment.text
                 val ranges = SentenceRanges.split(text)
                 if (ranges.isEmpty()) continue
@@ -62,8 +66,8 @@ class SentenceIndexer {
                 val locator = if (segment.locator.text.highlight == null) {
                     segment.locator.copy(text = Locator.Text(highlight = text))
                 } else segment.locator
-                // Store each original locator once. Expanding before/after for every sentence
-                // is quadratic for long paragraphs, and also repeats all JSON fields per sentence.
+                // 原始定位只保存一次；逐句展开 before／after 会令长段落的上下文量平方增长，
+                // 还会为每个句子重复全部 JSON 字段。
                 sourceLocatorCharacters += locator.toJSON().toString().length
                 if (sourceLocatorCharacters > SpeechIndexLimits.MAX_SOURCE_LOCATOR_CHARACTERS) {
                     throw BookImportException("书籍定位信息过大，暂不支持导入")
@@ -94,6 +98,7 @@ class SentenceIndexer {
         return sentences
     }
 
+    /** 展平嵌套目录以查找资源标题；同资源多个锚点仍使用正文资源作为章节边界。 */
     private fun flatten(links: List<Link>): List<Link> = buildList {
         for (link in links) {
             add(link)
@@ -102,13 +107,17 @@ class SentenceIndexer {
     }
 }
 
-/** Pure deterministic UTF-16 ranges. Keep this algorithm versioned with the persisted index. */
+/** 纯函数分句规则，返回确定性的 UTF-16 范围；规则变更必须与持久化定位索引版本同步。 */
 internal object SentenceRanges {
     const val MAX_LENGTH = 500
     private const val ENDINGS = "。！？!?；;\n\r"
     private const val CLOSING = "\"'”’）)]】》」』〕〉〗〙〛"
     private const val SOFT = "，,、：:"
 
+    /**
+     * 优先按句末标点分句，长句尽量在后半段的空白或软标点处分割。
+     * 裁去两端空白并过滤无字母／数字片段；按 Unicode 码点前进，避免切断 UTF-16 代理对。
+     */
     fun split(text: String, maxLength: Int = MAX_LENGTH): List<IntRange> {
         require(maxLength >= 2)
         val ranges = ArrayList<IntRange>()

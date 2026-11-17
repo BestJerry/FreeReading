@@ -28,20 +28,26 @@ import org.readium.r2.shared.util.use
 import org.readium.r2.streamer.PublicationOpener
 import org.readium.r2.streamer.parser.epub.EpubParser
 
+/** 书籍导入／打开时可向界面直接呈现的失败信息，并保留底层异常供诊断。 */
 class BookImportException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
-/** Opens only local, unprotected reflowable EPUBs. The caller owns the returned publication. */
+/**
+ * 打开并校验本地、无 DRM 的可重排 EPUB，统一导入和阅读所需的 Readium 配置。
+ * 成功返回的 Publication 由调用方负责关闭；失败与取消路径在内部释放已取得的资源。
+ */
 class ReadiumEngine(context: Context) {
     private val retriever = AssetRetriever(context.applicationContext.contentResolver, DefaultHttpClient())
     private val opener = PublicationOpener(EpubParser())
 
+    /** 导入入口：检查压缩包、书籍属性及每个正文资源，可报告资源验证进度。 */
     suspend fun open(file: File, onProgress: ((Long, Long?) -> Unit)? = null): Publication =
         openValidated(file, onProgress, reading = false)
 
-    /** Opens an already imported private book without repeating its whole-text import check. */
+    /** 打开已导入的私有书籍；保留结构校验，但不重复逐章读取全文，降低冷打开等待。 */
     internal suspend fun openForReading(file: File): Publication =
         openValidated(file, onProgress = null, reading = true)
 
+    /** 将文件打开工作移至 IO 线程，并处理跨调度器交付期间取消造成的资源泄漏。 */
     private suspend fun openValidated(file: File, onProgress: ((Long, Long?) -> Unit)?,
                                       reading: Boolean): Publication {
         var pending: Publication? = null
@@ -50,12 +56,13 @@ class ReadiumEngine(context: Context) {
                 openLocal(file, onProgress, reading).also { pending = it }
             }
         } catch (error: Throwable) {
-            // Cancellation during the dispatcher handoff can discard a successfully opened value.
+            // 调度器切回调用方时可能收到取消，连已成功打开但尚未交付的对象也需要关闭。
             pending?.close()
             throw error
         }
     }
 
+    /** 建立带 BOM 兼容内容服务的 Publication，校验失败时连同底层 asset 一并释放。 */
     @OptIn(ExperimentalReadiumApi::class)
     private suspend fun openLocal(file: File, onProgress: ((Long, Long?) -> Unit)?,
                                   reading: Boolean): Publication {
@@ -69,7 +76,7 @@ class ReadiumEngine(context: Context) {
             if (!asset.format.conformsTo(Specification.Epub)) {
                 throw BookImportException("目前仅支持 EPUB 格式")
             }
-            // Readium 3.1.2 ignores its constructor hook; the per-open hook is applied to this builder.
+            // Readium 3.1.2 未采用构造时的钩子，需要在每次打开时配置内容迭代器。
             opener.open(asset, allowUserInteraction = false, onCreatePublication = {
                 servicesBuilder.contentServiceFactory = DefaultContentService.createFactory(
                     listOf(BomAwareHtmlContentIteratorFactory()))
@@ -83,12 +90,12 @@ class ReadiumEngine(context: Context) {
         try {
             validatePublication(publication, onProgress, readAllChapters = !reading)
             if (reading) {
-                // Readium's Fragment constructor calls runBlocking on this service. Populate its
-                // existing cache here on IO, with the same position/progression algorithm.
+                // Readium Fragment 构造时会同步调用位置服务；先在 IO 线程填充其缓存，
+                // 保持原有位置／进度算法，避免主线程首次遍历整书。
                 publication.positionsByReadingOrder()
             }
             currentCoroutineContext().ensureActive()
-            // Publication retains the asset's container until Publication.close().
+            // Publication 持有 asset 的容器，直到调用方执行 Publication.close()。
             return publication
         } catch (error: Throwable) {
             publication.close()
@@ -96,6 +103,7 @@ class ReadiumEngine(context: Context) {
         }
     }
 
+    /** 拒绝 DRM、字体混淆算法白名单之外的加密、固定版式和外部正文；导入时另检查正文可读取。 */
     private suspend fun validatePublication(publication: Publication, onProgress: ((Long, Long?) -> Unit)?,
                                             readAllChapters: Boolean) {
         if (publication.isProtected || publication.isRestricted) {
@@ -124,8 +132,8 @@ class ReadiumEngine(context: Context) {
             throw BookImportException("这本 EPUB 的正文依赖外部资源，暂不支持导入")
         }
         if (!readAllChapters) return
-        // Readium's content iterator logs unreadable chapters and skips them. Check them here so
-        // a damaged archive cannot silently import an incomplete speech index.
+        // Readium 内容迭代器会记录并跳过无法读取的章节；导入时提前完整检查，
+        // 避免损坏文件静默生成缺章的听书索引。
         val total = publication.readingOrder.size.toLong()
         onProgress?.invoke(0, total)
         for ((index, link) in publication.readingOrder.withIndex()) {
@@ -141,6 +149,7 @@ class ReadiumEngine(context: Context) {
         }
     }
 
+    /** 打开前检查 ZIP 路径、重复文件、原文件大小及条目声明的解压容量，并确认必需的格式标识文件。 */
     private suspend fun validateArchive(file: File) {
         if (!file.isFile || file.length() == 0L) throw BookImportException("书籍文件为空或已不存在")
         if (file.length() > MAX_SOURCE_BYTES) throw BookImportException("书籍超过 100 MB，暂不支持导入")

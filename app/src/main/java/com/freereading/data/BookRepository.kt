@@ -33,7 +33,10 @@ import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.util.use
 
-/** One instance per application. Original books and speech indexes live in private app storage. */
+/**
+ * 应用级本地书库，管理私有目录中的 EPUB、听书索引、封面和进度。
+ * mutations 串行化导入／删除／索引迁移；progressLock 单独保护进度，避免播放保存被整书解析阻塞。
+ */
 class BookRepository(context: Context) {
     private val appContext = context.applicationContext
     private val root = File(appContext.filesDir, "books")
@@ -48,6 +51,7 @@ class BookRepository(context: Context) {
     val books: StateFlow<List<BookRecord>> = mutableBooks.asStateFlow()
     val readium = ReadiumEngine(appContext)
 
+    /** 清理上次中断留下的暂存／回收目录，并重新发布可用的书架元数据。 */
     suspend fun refresh(): Unit = withContext(Dispatchers.IO) {
         mutations.withLock {
             ensureRoot()
@@ -57,6 +61,10 @@ class BookRepository(context: Context) {
         }
     }
 
+    /**
+     * 在暂存目录内完成复制去重、EPUB 校验、分句和索引保存，最后重命名目录提交书籍。
+     * 原文件哈希相同时复用已有记录；失败或取消会清理本次尚未提交的文件。
+     */
     suspend fun importBook(uri: Uri, onProgress: ((BookImportProgress) -> Unit)? = null): BookRecord = withContext(Dispatchers.IO) {
         val progress = onProgress?.let { ImportProgressReporter(it) }
         progress?.report(ImportStage.WAITING)
@@ -120,13 +128,16 @@ class BookRepository(context: Context) {
             } catch (error: Exception) {
                 throw BookImportException("导入失败：文件无法读取、内容损坏或设备空间不足", error)
             } finally {
-                // Also runs on cancellation; a committed directory has already moved away.
+                // 协程取消时也清理暂存目录；已提交的目录已通过重命名移到正式位置。
                 staging.deleteRecursively()
             }
         }
     }
 
-    /** A reading page only needs metadata and its visual cursor; full speech stays lazy. */
+    /**
+     * 为阅读首屏准备元数据和页面位置，新版听书索引保持按需解码。
+     * 旧版定位必须先完成迁移；快速重开同书时先等待上一阅读页的最终保存。
+     */
     suspend fun prepareReadingBook(bookId: String): ReadingBookBootstrap = withContext(Dispatchers.IO) {
         awaitReadingSaves(bookId)
         mutations.withLock {
@@ -137,7 +148,7 @@ class BookRepository(context: Context) {
                 val textVersion = readTextIndexVersion(dir)
                 if (textVersion > TEXT_INDEX_VERSION) throw BookImportException("书籍索引来自更新版本，请更新应用后打开")
                 if (textVersion < TEXT_INDEX_VERSION) {
-                    // A legacy visual/audio cursor cannot be used until its index has been rebased.
+                    // 旧版页面／音频游标只有在定位索引迁移后才能安全使用。
                     val migrated = try {
                         migrateTextIndex(dir, record)
                     } catch (error: BookImportException) {
@@ -147,7 +158,7 @@ class BookRepository(context: Context) {
                     }
                     return@withLock ReadingBookBootstrap(migrated.book, progress(bookId), migrated)
                 }
-                // Recover an interrupted AtomicFile write without scanning the JSON/source table.
+                // 恢复中断的原子写入，只检查文件大小，不扫描整份 JSON 或原文片段表。
                 AtomicFile(File(dir, INDEX_FILE)).openRead().use { input ->
                     if (input.channel.size() !in 1L..SpeechIndexLimits.MAX_INDEX_BYTES) {
                         throw IOException("Speech index is empty or too large")
@@ -173,7 +184,7 @@ class BookRepository(context: Context) {
         }
     }
 
-    /** A quick reopen of this book must observe its previous reader's final saved cursor. */
+    /** 登记阅读页的最终保存任务，使快速重开同书时能读取最新位置；按导入批次隔离旧任务。 */
     internal fun registerReadingSave(bookId: String, expectedAddedAt: Long, job: Job) {
         val pending = PendingReadingSave(expectedAddedAt, job)
         synchronized(readingSavesLock) {
@@ -189,6 +200,7 @@ class BookRepository(context: Context) {
         }
     }
 
+    /** 只等待当前导入批次尚未结束的阅读保存任务，避免旧书任务阻塞重新导入后的新书。 */
     private suspend fun awaitReadingSaves(bookId: String) {
         while (true) {
             val pending = synchronized(readingSavesLock) { readingSaves[bookId]?.toList().orEmpty() }
@@ -196,19 +208,20 @@ class BookRepository(context: Context) {
             val addedAt = try {
                 synchronized(progressLock) { readRecord(directory(bookId)).addedAt }
             } catch (_: Exception) {
-                // The ordinary preparation path reports missing/corrupt metadata consistently.
+                // 元数据缺失或损坏交由正常准备流程统一报告。
                 return
             }
             val sameGeneration = synchronized(readingSavesLock) {
                 readingSaves[bookId].orEmpty().filter { it.expectedAddedAt == addedAt && !it.job.isCompleted }
             }
             if (sameGeneration.isEmpty()) return
-            // Neither the book mutation mutex nor the registry/progress lock may be held here:
-            // a final save can need loadSpeechBook() before it can commit its cursor.
+            // 等待时不得持有书籍互斥锁、任务登记锁或进度锁：
+            // 最终保存可能先调用 loadSpeechBook()，持锁等待会相互阻塞。
             sameGeneration.forEach { it.job.join() }
         }
     }
 
+    /** 按需读取完整听书索引；文件指纹与元数据一致时复用弱引用缓存，旧索引先迁移。 */
     suspend fun loadSpeechBook(bookId: String): SpeechBook = withContext(Dispatchers.IO) {
         mutations.withLock {
             val dir = directory(bookId)
@@ -248,18 +261,23 @@ class BookRepository(context: Context) {
 
     fun bookFile(bookId: String): File = File(directory(bookId), BOOK_FILE)
 
+    /** 在线程安全的进度缓存中读取最新位置，缺少合法进度时返回初始游标。 */
     fun progress(bookId: String): ReadingProgress = synchronized(progressLock) {
         val dir = directory(bookId)
         if (!File(dir, METADATA_FILE).isFile) return@synchronized ReadingProgress(bookId)
         progressCache[bookId] ?: readProgress(dir, bookId).also { progressCache[bookId] = it }
     }
 
+    /**
+     * 按更新时间保存较新的进度，并可校验导入批次，拒绝迟到写入。
+     * 磁盘写入失败仍保留最新内存位置，不让当前播放因存储问题中断。
+     */
     fun saveProgress(progress: ReadingProgress, expectedAddedAt: Long? = null): Unit = synchronized(progressLock) {
         val dir = directory(progress.bookId)
-        // A delayed player/reader callback must never recreate a removed book.
+        // 拒绝迟到的播放／阅读回调，防止重新创建已经移除的书籍。
         if (!dir.isDirectory || !File(dir, METADATA_FILE).isFile) return@synchronized
         if (expectedAddedAt != null) {
-            // A deferred reader save may outlive deletion and reimport of the same EPUB hash.
+            // 同一 EPUB 的哈希不变；用导入时间拒绝移除后重新导入前的旧保存任务。
             val currentAddedAt = try { readRecord(dir).addedAt } catch (_: Exception) { return@synchronized }
             if (currentAddedAt != expectedAddedAt) return@synchronized
         }
@@ -271,26 +289,30 @@ class BookRepository(context: Context) {
         )
         progressCache[progress.bookId] = cleaned
         try {
-            // A late pre-migration callback must not certify an old locator as already rebased.
+            // 迁移前回调晚到时，不能把旧定位标记为已完成迁移。
             val textVersion = progressVersionForSave(dir)
             writeProgressRecord(dir, cleaned, textVersion)
         } catch (error: IOException) {
-            // Playback stays usable if storage fills; retain the latest position in memory.
+            // 空间不足时仍保留最新内存位置，避免影响当前阅读／播放。
             Log.w(TAG, "Could not persist reading progress", error)
         }
     }
 
+    /**
+     * 从原 EPUB 重建定位索引并迁移最新游标，依次提交索引、进度和元数据。
+     * 元数据完成前保留旧索引；进度并发变化时重新定位，确保迁移中断后仍可重试。
+     */
     private suspend fun migrateTextIndex(dir: File, record: BookRecord): SpeechBook {
         speechBookCache.remove(record.id)
         val publication = readium.open(File(dir, BOOK_FILE))
         val rebuilt = try {
             val sentences = SentenceIndexer().index(publication)
             val book = SpeechBook(record.copy(sentenceCount = sentences.size), sentences)
-            // Keep the original index through retries and concurrent legacy progress saves.
-            // Only one old sentence is streamed from it; the old book is never loaded in full.
+            // 重试和并发旧进度保存期间保留原索引。
+            // 只流式提取迁移所需的一句，不把旧书的完整索引再次装入内存。
             val legacyIndex = preserveLegacyIndex(dir)
-            // Metadata is the final commit marker. An interrupted new index must never be read
-            // against the old count: retries always rebuild from the unchanged EPUB first.
+            // 元数据是迁移最终提交标记，不能用旧句数读取中断写入的新索引；
+            // 重试时始终从未改变的 EPUB 重新建立索引。
             writeIndex(File(dir, INDEX_FILE), book)
             while (true) {
                 currentCoroutineContext().ensureActive()
@@ -303,8 +325,8 @@ class BookRepository(context: Context) {
                 }
                 currentCoroutineContext().ensureActive()
                 val committed = synchronized(progressLock) {
-                    // Progress writes do not use the book mutex. Rebase again if a newer legacy
-                    // cursor was written while the source text was being resolved.
+                    // 进度写入不占用书籍互斥锁；解析原文期间若收到更新的旧版游标，
+                    // 就重新定位，确保提交的是最新进度。
                     if (readMigrationCheckpoint(dir, record.id) != checkpoint) false else {
                         writeProgressRecord(dir, rebased, TEXT_INDEX_VERSION)
                         progressCache[record.id] = rebased
@@ -324,26 +346,27 @@ class BookRepository(context: Context) {
         return rebuilt
     }
 
+    /** 将旧索引保留为迁移证据；已有备份直接复用，避免重试时覆盖唯一的旧定位来源。 */
     private fun preserveLegacyIndex(dir: File): File? {
         val legacy = File(dir, LEGACY_INDEX_FILE)
         if (legacy.isFile) return legacy
         if (legacy.exists()) throw IOException("Cannot preserve the previous speech index")
         val index = File(dir, INDEX_FILE)
         if (!index.exists() && !File(index.path + ".bak").exists()) return null
-        // Recover an interrupted AtomicFile write before moving its committed base file.
+        // 先恢复中断的原子写入，再移动已提交的基础文件以保留旧索引。
         AtomicFile(index).openRead().use { }
         if (!index.renameTo(legacy)) throw IOException("Cannot preserve the previous speech index")
         return legacy
     }
 
+    /** 页面定位不含文本时，仅提取对应旧句作为迁移证据，避免加载整份旧索引。 */
     private suspend fun legacySentence(file: File?, record: BookRecord, saved: ReadingProgress): SpeechSentence? {
         if (file == null) return null
         val locator = saved.locatorJson?.let { runCatching { Locator.fromJSON(JSONObject(it)) }.getOrNull() }
             ?: return null
         if (!locator.text.highlight.isNullOrBlank()) return null
         return try {
-            // The count must match the old metadata: a previous implementation may already
-            // have written a new index before its metadata commit was interrupted.
+            // 句数必须与旧元数据一致：旧实现可能在写好新索引后中断了元数据提交。
             indexStore.readSentence(file, record.id, record.sentenceCount, saved.sentenceIndex)
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -354,10 +377,11 @@ class BookRepository(context: Context) {
     }
 
     private fun deleteLegacyIndex(dir: File) {
-        // Metadata2 has committed. Cleanup is optional and can be retried on the next load.
+        // 新版元数据已提交；旧索引清理失败时可在下次加载时重试。
         AtomicFile(File(dir, LEGACY_INDEX_FILE)).delete()
     }
 
+    /** 先将书籍目录移入回收目录并清除内存记录，再清理文件与语音缓存。 */
     suspend fun removeBook(bookId: String): Unit = withContext(Dispatchers.IO) {
         mutations.withLock {
             val dir = directory(bookId)
@@ -368,13 +392,14 @@ class BookRepository(context: Context) {
                 speechBookCache.remove(bookId)
                 mutableBooks.value = mutableBooks.value.filterNot { it.id == bookId }
             }
-            // Rename is the commit point. Interrupted cleanup is retried by refresh().
+            // 重命名即提交移除；之后清理中断可由 refresh() 重试。
             trash.deleteRecursively()
             File(appContext.cacheDir, "speech/$bookId").deleteRecursively()
             Unit
         }
     }
 
+    /** 单次读取来源流完成复制和 SHA-256 去重标识计算，按实际字节限制文件大小。 */
     private suspend fun copyAndHash(uri: Uri, target: File, progress: ImportProgressReporter?): String {
         val digest = MessageDigest.getInstance("SHA-256")
         var total = if (progress != null) sourceSize(uri) else null
@@ -395,7 +420,7 @@ class BookRepository(context: Context) {
                     digest.update(buffer, 0, count)
                     output.write(buffer, 0, count)
                     if (total != null && size > total!!) total = null
-                    // A provider's advertised size can be wrong; only EOF + sync finish copying.
+                    // 来源声明的大小可能不准确，只有读到 EOF 且同步成功才表示复制完成。
                     if (total == null || size < total!!) progress?.report(ImportStage.COPYING, size, total)
                 }
                 output.fd.sync()
@@ -406,6 +431,7 @@ class BookRepository(context: Context) {
         return digest.digest().joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
     }
 
+    /** 仅查询来源元数据；大小未知或无法查询时返回 null，不为测量消耗输入流。 */
     private fun sourceSize(uri: Uri): Long? {
         if (uri.scheme == "file") {
             return uri.path?.let(::File)?.takeIf(File::isFile)?.length()?.takeIf { it > 0 }
@@ -420,7 +446,7 @@ class BookRepository(context: Context) {
         } catch (_: Exception) {
             null
         }
-        // Never open a provider stream just to measure it: remote/pipe sources may be one-shot.
+        // 不为测量大小额外打开输入流，远程或管道来源可能只允许读取一次。
         return queried
     }
 
@@ -441,6 +467,7 @@ class BookRepository(context: Context) {
         return File(root, bookId)
     }
 
+    /** 在 mutations 保护下重建书架；坏元数据只跳过对应书籍，不阻塞其他书籍显示。 */
     private fun refreshLocked() {
         mutableBooks.value = root.listFiles().orEmpty()
             .filter { it.isDirectory && BOOK_ID.matches(it.name) }
@@ -456,6 +483,7 @@ class BookRepository(context: Context) {
         speechBookCache.keys.retainAll(mutableBooks.value.map { it.id }.toSet())
     }
 
+    /** 校验元数据版本、书籍标识和新版句数边界，封面路径由私有目录重新生成。 */
     private fun readRecord(directory: File): BookRecord {
         val json = readSmallJson(File(directory, METADATA_FILE))
         val id = json.getString("id")
@@ -463,8 +491,8 @@ class BookRepository(context: Context) {
             throw BookImportException("书籍记录无效，请移除后重新导入")
         }
         val count = json.getInt("sentenceCount")
-        // A legacy/interrupted index may have a stale count. Its EPUB will be reindexed before
-        // any index allocation or sentence-count validation is attempted.
+        // 旧版或中断迁移的句数可能过时；这类书会先从 EPUB 重建索引，
+        // 不使用旧句数直接分配索引内存或进行新版句数校验。
         if (json.optInt(TEXT_INDEX_VERSION_FIELD, 1) >= TEXT_INDEX_VERSION &&
             count !in 1..SpeechIndexLimits.MAX_SENTENCES) throw BookImportException("书籍句子索引无效，请重新导入")
         return BookRecord(
@@ -478,6 +506,7 @@ class BookRepository(context: Context) {
         )
     }
 
+    /** 尽量生成约 512 像素的采样封面；封面缺失、解码失败或内存不足不阻止导入。 */
     private suspend fun writeCover(publication: Publication, file: File): Boolean {
         try {
             val link = (publication.readingOrder + publication.resources + publication.links)
@@ -536,14 +565,18 @@ class BookRepository(context: Context) {
     private suspend fun readIndex(file: File, record: BookRecord): List<SpeechSentence> =
         indexStore.read(file, record.id, record.sentenceCount)
 
+    /** 用文件长度与修改时间判断听书内存缓存是否仍对应当前磁盘内容。 */
     private data class FileStamp(val length: Long, val modified: Long)
+    /** 一次阅读页退出保存任务及其所属的书籍导入批次。 */
     private class PendingReadingSave(val expectedAddedAt: Long, val job: Job)
+    /** 完整听书书籍的弱引用缓存，不强制长篇句子列表长期常驻内存。 */
     private data class CachedSpeechBook(
         val record: BookRecord,
         val stamp: List<FileStamp>,
         val reference: WeakReference<SpeechBook>,
     )
 
+    /** 三个必要文件均存在时才生成缓存指纹，缺文件立即使缓存失效。 */
     private fun cacheStamp(dir: File): List<FileStamp>? {
         val files = listOf(BOOK_FILE, METADATA_FILE, INDEX_FILE).map { File(dir, it) }
         if (files.any { !it.isFile }) return null
@@ -556,11 +589,13 @@ class BookRepository(context: Context) {
         }
     }
 
+    /** 进度与其定位索引版本一起保存，迁移时据此区分新旧游标。 */
     private data class StoredProgress(val progress: ReadingProgress, val textIndexVersion: Int)
 
     private fun readProgress(dir: File, bookId: String): ReadingProgress =
         readStoredProgress(dir, bookId)?.progress ?: ReadingProgress(bookId, updatedAt = 0L)
 
+    /** 读取并校验小型进度文件；无文件或损坏时返回 null，由调用方选择恢复策略。 */
     private fun readStoredProgress(dir: File, bookId: String): StoredProgress? = try {
         val json = readSmallJson(File(dir, PROGRESS_FILE))
         if (json.getString("bookId") != bookId) throw IOException("Progress belongs to another book")
@@ -575,7 +610,7 @@ class BookRepository(context: Context) {
         )
         StoredProgress(progress, json.optInt(TEXT_INDEX_VERSION_FIELD, 1))
     } catch (_: Exception) {
-        // No saved progress, or an interrupted/corrupt small file: start safely from the beginning.
+        // 无进度或进度文件中断／损坏时返回 null，由调用方选择内存游标或初始位置。
         null
     }
 
@@ -589,7 +624,7 @@ class BookRepository(context: Context) {
         1
     }
 
-    /** Must be called under progressLock; failed normal writes can still have a newer live cursor. */
+    /** 必须在 progressLock 内调用；普通落盘失败时，内存中仍可能保存更新的有效游标。 */
     private fun readMigrationCheckpoint(dir: File, bookId: String): StoredProgress? {
         val stored = readStoredProgress(dir, bookId)
         val cached = progressCache[bookId]
@@ -599,7 +634,7 @@ class BookRepository(context: Context) {
         } else stored
     }
 
-    /** Migration must propagate write failures; ordinary playback can keep its in-memory cursor. */
+    /** 迁移写盘失败必须向上传播，不能宣告完成；普通播放保存则允许只保留内存游标。 */
     private fun writeProgressRecord(dir: File, progress: ReadingProgress, textIndexVersion: Int) {
         val json = JSONObject().apply {
             put("bookId", progress.bookId)
@@ -612,12 +647,14 @@ class BookRepository(context: Context) {
         atomicWrite(File(dir, PROGRESS_FILE)) { it.write(json.toString().toByteArray(Charsets.UTF_8)) }
     }
 
+    /** 小型元数据单独限长读取，避免异常文件作为整个 JSON 一次性占满内存。 */
     private fun readSmallJson(file: File): JSONObject = AtomicFile(file).openRead().use { input ->
         if (input.channel.size() > 262_144L) throw IOException("Metadata file is too large")
         val bytes = input.readBytes()
         JSONObject(bytes.toString(Charsets.UTF_8))
     }
 
+    /** 原子写入小文件并确认提交；异常时调用 failWrite 清理未提交内容，再向上传播失败。 */
     private inline fun atomicWrite(file: File, write: (FileOutputStream) -> Unit) {
         val atomic = AtomicFile(file)
         val stream = atomic.startWrite()

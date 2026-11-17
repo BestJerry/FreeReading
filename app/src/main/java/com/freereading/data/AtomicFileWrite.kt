@@ -5,7 +5,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 
-/** AtomicFile can log sync/rename failures without throwing; callers need an actual commit point. */
+/**
+ * 同步并确认原子文件已提交；AtomicFile 的部分同步／重命名失败只写日志，不会抛异常。
+ * 通过长度和临时文件检查向调用方报告提交异常，避免将未确认的写入视为成功。
+ */
 internal fun AtomicFile.finishWriteChecked(output: FileOutputStream) {
     val expectedLength = output.channel.size()
     output.fd.sync()

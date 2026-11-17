@@ -31,7 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.collect
 
-/** Each opening keeps its own reading cursor while the user browses the table of contents. */
+/** 每次打开按当时的阅读位置定位并标记当前章节；用户浏览目录后不再自动抢回位置。 */
 @Composable
 internal fun ReaderContentsDialog(
     entries: List<ContentsEntry>,
@@ -59,7 +59,7 @@ internal fun ReaderContentsDialog(
             }
     }
     LaunchedEffect(currentIndex, entries.size) {
-        // A fragment lookup may finish after opening. Resolve it once, without undoing browsing.
+        // 锚点解析可能晚于弹窗打开；仅补定位一次，且不能覆盖用户已经进行的浏览。
         if (openingIndex == null && currentIndex != null && entries.isNotEmpty()) {
             val resolvedIndex = currentIndex.coerceIn(entries.indices)
             val untouched = !userBrowsed && !listState.isScrollInProgress &&
@@ -76,7 +76,7 @@ internal fun ReaderContentsDialog(
         text = {
             LazyColumn(state = listState,
                 modifier = Modifier.fillMaxWidth().heightIn(max = 380.dp).testTag("reader-contents-list")) {
-                // Resources and fragments may repeat in an EPUB's navigation tree.
+                // EPUB 目录中的资源和锚点可能重复，使用展平索引保证列表 key 唯一。
                 itemsIndexed(entries, key = { index, _ -> index }) { index, entry ->
                     val isCurrent = index == openingIndex
                     TextButton(onClick = { onSelect(entry) }, modifier = Modifier.fillMaxWidth()

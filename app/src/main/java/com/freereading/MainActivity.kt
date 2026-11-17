@@ -90,9 +90,11 @@ import com.freereading.ui.MutedInk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+/** 书架入口，展示本地书籍和后台听书状态，并将阅读／听书导航交给独立阅读页。 */
 class MainActivity : ComponentActivity() {
     private val model: LibraryViewModel by viewModels()
 
+    /** 安装书架 Compose 界面，阅读与听书入口共用书籍 ID，通过参数决定是否打开播放器。 */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -108,6 +110,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** 按生命周期收集书架和播放状态，统一承载文件选择、导入进度、错误及删除确认。 */
 @Composable
 private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, openListening: (String) -> Unit) {
     val books by model.books.collectAsStateWithLifecycle()
@@ -231,6 +234,7 @@ private fun LibraryScreen(model: LibraryViewModel, openBook: (String) -> Unit, o
     }
 }
 
+/** 空书架引导；复用导入忙碌状态，避免通过空态按钮重复提交任务。 */
 @Composable
 private fun EmptyLibrary(busy: Boolean, isImporting: Boolean, onImport: () -> Unit) {
     Column(
@@ -280,6 +284,7 @@ private fun EmptyLibrary(busy: Boolean, isImporting: Boolean, onImport: () -> Un
     }
 }
 
+/** 单本书的展示与操作入口，删除动作交由上层确认后执行。 */
 @Composable
 private fun BookRow(book: BookRecord, onOpen: () -> Unit, onDelete: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
@@ -305,6 +310,7 @@ private fun BookRow(book: BookRecord, onOpen: () -> Unit, onDelete: () -> Unit) 
     }
 }
 
+/** 在 IO 线程按采样尺寸解码封面；缺图或解码失败时使用由书籍 ID 决定的占位封面。 */
 @Composable
 private fun BookCover(book: BookRecord, modifier: Modifier = Modifier) {
     val cover by produceState<ImageBitmap?>(null, book.coverPath) {
@@ -339,6 +345,7 @@ private fun BookCover(book: BookRecord, modifier: Modifier = Modifier) {
     }
 }
 
+/** 展示后台播放的迷你控制条；只发送控制命令，播放器及 TTS 生命周期由服务持有。 */
 @Composable
 private fun NowPlaying(state: PlaybackSnapshot, openBook: (String) -> Unit) {
     val context = LocalContext.current

@@ -22,7 +22,7 @@ import com.freereading.R
 import com.freereading.data.BookImportProgress
 import com.freereading.data.ImportStage
 
-/** Reports the current import step; percentages deliberately do not imply overall completion. */
+/** 展示阶段内进度，未知总量时滚动显示；各阶段百分比独立，仅 COMPLETED 表示整个导入完成。 */
 @Composable
 internal fun ImportProgressIndicator(progress: BookImportProgress, modifier: Modifier = Modifier) {
     val fraction = progress.fraction?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
@@ -77,7 +77,7 @@ internal fun ImportProgressIndicator(progress: BookImportProgress, modifier: Mod
         if (fraction == null) {
             LinearProgressIndicator(modifier = barModifier)
         } else {
-            // Capture this immutable value so semantics can never observe a later zero/unknown total.
+            // 捕获本次不可变比例，避免无障碍语义稍后读取到已变化为零或未知的总量。
             LinearProgressIndicator(progress = { fraction }, modifier = barModifier)
         }
         if (step != null) {

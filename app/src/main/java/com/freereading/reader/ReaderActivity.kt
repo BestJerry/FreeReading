@@ -113,7 +113,11 @@ import org.readium.r2.shared.util.use
 import org.readium.r2.navigator.preferences.Color as ReadiumColor
 import org.readium.r2.navigator.preferences.FontFamily as ReadiumFontFamily
 
-/** Reading UI observes the service; the Activity never owns a TTS engine or audio player. */
+/**
+ * 承载 EPUB 阅读、目录和独立听书界面，协调原文定位、句子高亮与阅读进度。
+ * 只通过 PlaybackHub 观察和控制音频，TTS 与播放器的生命周期由后台服务管理。
+ * 常规打开优先显示正文，未缓存的听书索引按需加载；异步定位以代次和书籍版本校验，避免旧任务覆盖新操作。
+ */
 class ReaderActivity : FragmentActivity() {
     private val repository get() = (application as ReadingApplication).repository
     private val bookId get() = intent.getStringExtra(EXTRA_BOOK_ID).orEmpty()
@@ -136,7 +140,7 @@ class ReaderActivity : FragmentActivity() {
     private var showAppearance by mutableStateOf(false)
     private var showReadingControls by mutableStateOf(false)
     private var showListening by mutableStateOf(false)
-    // User preference; browsing can temporarily detach without turning this preference off.
+    // 用户的长期跟随偏好；手动浏览可临时脱离，但不会关闭此偏好。
     private var followAudio by mutableStateOf(true)
     private var fontScale by mutableStateOf(1.15f)
     private var pageStyle by mutableStateOf("paper")
@@ -168,7 +172,9 @@ class ReaderActivity : FragmentActivity() {
     private var audioPageReady = false
     private val sourceResolverMutex = Mutex()
     private var sourceResolver: Pair<String, SourceSentenceResolver>? = null
+    /** 绑定视觉页与导航代次的可见文本快照，供 WebView 销毁前后的进度保存复用。 */
     private data class VisibleTextSnapshot(val page: Locator, val textAnchor: Locator, val revision: Long)
+    /** 仅保留影响原文同步的播放状态，过滤仅句内音频时间变化的重复同步。 */
     private data class AudioCursor(val bookId: String?, val sentenceIndex: Int,
                                    val playing: Boolean, val preparing: Boolean, val sessionId: String?,
                                    val failedStartId: String?)
@@ -183,6 +189,7 @@ class ReaderActivity : FragmentActivity() {
     private val muted: Color get() = ink.copy(alpha = 0.62f)
     private val accent: Color get() = if (pageStyle == "dark") Color(0xFFB5CDB5) else Color(0xFF49674F)
 
+    /** 恢复阅读意图与未确认的起播请求，再重新打开本地书籍并创建导航视图。 */
     override fun onCreate(savedInstanceState: Bundle?) {
         restoredLocator = savedInstanceState?.getString(STATE_LOCATOR)
         followAudio = savedInstanceState?.getBoolean(STATE_FOLLOW, true) ?: true
@@ -204,8 +211,8 @@ class ReaderActivity : FragmentActivity() {
                     it.getLong("offset").coerceAtLeast(0), it.getLong("updated"))
             }
         resumableProgress = pendingStoppedProgress
-        // Readium Fragments retain a Publication supplied by their factory. Rebuild them after
-        // reopening the local file instead of restoring a Fragment with a closed/missing book.
+        // Readium Fragment 持有工厂传入的 Publication；必须先重开文件再重建，
+        // 避免系统恢复的 Fragment 引用已经关闭或缺失的书籍。
         super.onCreate(null)
         fontScale = preferences.getFloat("font_scale", 1.15f).coerceIn(0.8f, 2f)
         pageStyle = preferences.getString("page_style", "paper").orEmpty()
@@ -214,11 +221,12 @@ class ReaderActivity : FragmentActivity() {
         openBook()
     }
 
+    /** 固定正文视口尺寸，加载遮罩和菜单叠加其上，防止菜单显隐引起重新分页。 */
     private fun buildViews() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         documentFrame = FrameLayout(this).apply {
             id = fragmentContainerId
-            // Reserve only the thin reading footer, in both reading/menu states.
+            // 阅读状态和菜单状态都只为薄页脚预留相同高度。
             setPadding(0, 0, 0, (28 * resources.displayMetrics.density).toInt())
         }
         openingOverlay = composeView { OpeningState() }
@@ -240,6 +248,7 @@ class ReaderActivity : FragmentActivity() {
         setContent { FreeReadingTheme { content() } }
     }
 
+    /** 取消上次打开和索引任务，在后台准备正文；安装失败或取消时释放尚未接管的书籍。 */
     private fun openBook() {
         loadJob?.cancel()
         speechGeneration += 1
@@ -279,6 +288,7 @@ class ReaderActivity : FragmentActivity() {
         installReadingNavigator(opened, book.book, saved, book)
     }
 
+    /** 综合重建位置、待确认起播和停止游标决定首屏，连接导航回调但不等待完整听书索引。 */
     private fun installReadingNavigator(opened: Publication, record: BookRecord, saved: ReadingProgress,
                                         cachedBook: SpeechBook?) {
         audioBinding?.cancel()
@@ -352,10 +362,10 @@ class ReaderActivity : FragmentActivity() {
                     val fragment = installedFragment ?: return
                     if (navigator !== fragment || fragment.view == null) return
                     audioPageReady = true
-                    // Readium can cache a decoration while dropping its script before isLoaded.
-                    // A new render generation forces a real DOM update once the page is ready.
+                    // 页面就绪前 Readium 可能已缓存高亮却丢弃对应脚本；
+                    // 推进渲染代次，确保就绪后真正更新 DOM。
                     audioHighlighter?.onPageLoaded()
-                    // Index decoding is deliberately outside the path to the first readable page.
+                    // 常规阅读在首个可读书页显示后启动索引解码；显式听书可提前启动同一任务。
                     if (speechBook == null && speechLoad?.isCancelled != true) speechLoader().start()
                 }
             },
@@ -370,11 +380,13 @@ class ReaderActivity : FragmentActivity() {
         navigator = fragment
         observeAudio(fragment)
         fragment.addInputListener(object : InputListener {
+            // 消费正文任意区域的普通轻触以统一切换菜单，避免触发 Readium 默认边缘翻页。
             override fun onTap(event: TapEvent): Boolean {
                 showReadingControls = !showReadingControls
                 return true
             }
 
+            // 这里只记录主动浏览，实际滑动翻页仍交给 Readium 处理。
             override fun onDrag(event: DragEvent): Boolean {
                 if (dragNavigation.shouldDetach(event, scroll)) markManualNavigation()
                 return false
@@ -388,6 +400,7 @@ class ReaderActivity : FragmentActivity() {
         observeLocator(fragment)
     }
 
+    /** 复用同一次延迟索引加载；首屏就绪或显式听书时执行，并校验重新导入与过期代次。 */
     private fun speechLoader(): Deferred<SpeechBook> {
         speechLoad?.takeUnless { it.isCancelled }?.let { return it }
         val token = speechGeneration
@@ -404,7 +417,7 @@ class ReaderActivity : FragmentActivity() {
 
     private suspend fun awaitSpeechBook(): SpeechBook = speechBook ?: speechLoader().await()
 
-    /** Completes listening capabilities without replacing the already visible reader. */
+    /** 补齐听书索引与恢复游标，不替换已显示的阅读视图；只有用户尚未导航时才补跳停止位置。 */
     private fun attachSpeechBook(book: SpeechBook) {
         if (book.book.id != bookId || readingRecord?.let { it.addedAt != book.book.addedAt } == true) return
         speechBook = book
@@ -431,8 +444,8 @@ class ReaderActivity : FragmentActivity() {
             snapshot.page == fragment.currentLocator.value && canSaveReadingLocation()) {
             lifecycleScope.launch {
                 try {
-                    // The DOM anchor was captured during loading; the cursor need not change
-                    // again before it can now be mapped to the completed listening index.
+                    // 加载期间已捕获 DOM 锚点，索引就绪后即可补充保存，
+                    // 无需等待用户再次翻页触发位置变化。
                     saveReadingLocation(fragment, snapshot.page)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -443,6 +456,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 在 Activity 处于 STARTED 及以上状态时观察阅读位置，合并短时间变化以减少重复保存。 */
     @OptIn(FlowPreview::class)
     private fun observeLocator(fragment: EpubNavigatorFragment) {
         lifecycleScope.launch {
@@ -455,6 +469,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 跟随 Fragment View 的生命周期重建高亮器，防止重建后的旧视图继续接收音频导航。 */
     private fun observeAudio(fragment: EpubNavigatorFragment) {
         fragment.viewLifecycleOwnerLiveData.observe(this) { owner ->
             if (navigator !== fragment) return@observe
@@ -482,7 +497,7 @@ class ReaderActivity : FragmentActivity() {
                     if (audioPageReady) synchronizer.onPageLoaded()
                     try {
                         PlaybackHub.state
-                            // Starting/resuming the same sentence must also catch up the page.
+                            // 同一句的重新起播或恢复也要追赶原文页，不能只比较句子编号。
                             .map { AudioCursor(it.bookId, it.sentenceIndex, it.isPlaying, it.isPreparing,
                                 it.playbackSessionId, it.startFailure?.requestId) }
                             .distinctUntilChanged()
@@ -495,6 +510,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 按当前朗读句请求更新或清除高亮；开启跟随时请求跳页，执行前仍须通过会话与页面校验。 */
     private fun synchronizeAudio() {
         val synchronizer = audioHighlighter ?: return
         val audio = PlaybackHub.state.value
@@ -506,6 +522,7 @@ class ReaderActivity : FragmentActivity() {
         synchronizer.request(target, navigate = followingAudio)
     }
 
+    /** 按请求 ID 确认起播或记录失败；确认之前不让旧播放状态抢回用户选择的页面。 */
     private fun acknowledgeAudioStart(audio: PlaybackSnapshot) {
         val pending = pendingAudioSentence ?: return
         val failure = audio.startFailure
@@ -516,20 +533,21 @@ class ReaderActivity : FragmentActivity() {
         }
         if (audio.bookId != bookId) return
         if (PlaybackHub.isPlaybackStartConfirmed(pendingAudioRequestId, audio.playbackSessionId)) {
-            // A hidden/recreated reader can miss the requested sentence and return at the next.
+            // 页面隐藏或重建时可能错过起播句，服务确认该请求或更新的请求后即可解除导航等待。
             clearPendingAudioStart()
         }
     }
 
+    /** 保存视觉页及首个可见段落对应的句子；听书会话持有游标时由服务独占保存。 */
     private suspend fun saveReadingLocation(fragment: EpubNavigatorFragment, page: Locator,
                                            finalSave: Boolean = false) {
-        // While this book owns the audio session, the service alone persists its canonical
-        // locator + sentence offset. Browsing the page must not overwrite the listening cursor.
+        // 本书占有音频会话时，由服务独占保存标准定位和句内偏移，
+        // 手动浏览原文不能覆盖听书游标。
         if (!canSaveReadingLocation()) return
         val expectedAddedAt = readingRecord?.addedAt ?: return
         if (speechBook == null) {
-            // Capture the DOM evidence while the WebView is alive; index decoding can finish
-            // later, including after the Activity's own deferred load has been cancelled.
+            // 趁 WebView 仍存活先捕获 DOM 定位证据，之后再等待索引解码；
+            // 即使 Activity 自己的延迟加载已取消，最终保存仍可完成。
             val revision = readingNavigationRevision
             val capturedAt = System.currentTimeMillis()
             val raw = freshVisibleRawAnchor(fragment, page) ?: visibleTextSnapshot?.takeIf {
@@ -549,6 +567,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 最终离页保存可在索引就绪后映射句子；提交前重验导航代次和书籍版本，避免迟到覆盖。 */
     private suspend fun saveDeferredReadingLocation(page: Locator, raw: Locator, chapter: Int,
                                                     revision: Long, capturedAt: Long, expectedAddedAt: Long) {
         val saved = withContext(Dispatchers.IO) {
@@ -564,7 +583,7 @@ class ReaderActivity : FragmentActivity() {
         withContext(Dispatchers.IO) { repository.saveProgress(saved, expectedAddedAt = expectedAddedAt) }
     }
 
-    /** Final saves can outlive the Activity Publication, so reopen only for an unresolved DOM anchor. */
+    /** 最终保存可能晚于 Activity 的 Publication 释放，仅在 DOM 锚点仍未解析时临时重开原文。 */
     private suspend fun deferredSourceSentenceIndex(raw: Locator,
                                                     candidates: List<SentenceLocatorMatcher.Anchor>): Int? {
         val anchor = (raw.locations["cssSelector"] as? String)?.takeIf(String::isNotBlank)
@@ -590,14 +609,15 @@ class ReaderActivity : FragmentActivity() {
     private fun canSaveReadingLocation(): Boolean =
         PlaybackHub.state.value.bookId != bookId && resumableProgress == null
 
+    /** 视觉定位保留精确页，文本锚点独立提供句子编号，不以页面百分比猜测听书位置。 */
     private fun readingProgressAt(page: Locator, textAnchor: Locator): ReadingProgress? {
         if (!canSaveReadingLocation()) return null
         val sentence = sentenceAt(textAnchor) ?: return null
-        // The visual locator restores the exact page. The independent text anchor resolves
-        // the first visible paragraph to a speech sentence, with no percentage conversion.
+        // 视觉页与首个可见段落的文本定位各司其职，保留两者而不转换百分比。
         return ReadingProgress(bookId, page.toJSON().toString(), sentence.index)
     }
 
+    /** 从当前 WebView 读取首个可见元素，查询期间翻页或导航意图变化则丢弃结果。 */
     private suspend fun freshVisibleRawAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
         val revision = readingNavigationRevision
         val fresh = queryNavigatorLocator { fragment.firstVisibleElementLocator() }
@@ -609,6 +629,7 @@ class ReaderActivity : FragmentActivity() {
         return null
     }
 
+    /** 将可见 DOM 元素解析为真实句子定位；文本直接匹配不足时用原始 XHTML 补充判断。 */
     private suspend fun freshVisibleTextAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
         val revision = readingNavigationRevision
         val fresh = freshVisibleRawAnchor(fragment, page)
@@ -628,17 +649,18 @@ class ReaderActivity : FragmentActivity() {
 
     private suspend fun visibleTextAnchor(fragment: EpubNavigatorFragment, page: Locator): Locator? {
         freshVisibleTextAnchor(fragment, page)?.let { return it }
-        // During teardown the WebView may already be gone. Reuse only an anchor measured
-        // for this exact visual page; never map page progression to text progression.
+        // 销毁阶段 WebView 可能已不可用，只复用同一视觉页和导航代次的锚点，
+        // 绝不将页面进度换算成正文进度。
         return visibleTextSnapshot?.takeIf {
             it.page == page && it.revision == readingNavigationRevision
         }?.textAnchor
     }
 
+    /** 为 Readium 的 JavaScript 定位请求补充可取消等待与超时，防止最终保存任务被悬挂。 */
     private suspend fun queryNavigatorLocator(query: suspend () -> Locator?): Locator? =
         withTimeoutOrNull(800) {
-            // Readium 3.1.2 uses suspendCoroutine around evaluateJavascript. Await its request
-            // through a cancellable continuation so teardown cannot retain our final save job.
+            // Readium 3.1.2 用不可取消的 suspendCoroutine 包装 evaluateJavascript，
+            // 外层使用可取消 continuation，确保视图销毁不会一直拖住最终保存。
             suspendCancellableCoroutine<Locator?> { continuation ->
                 val request = lifecycleScope.launch {
                     val result = try {
@@ -657,6 +679,7 @@ class ReaderActivity : FragmentActivity() {
             }
         }
 
+    /** 主动翻页、目录跳转或选文后临时脱离跟随，并将下一次起播改为新阅读位置。 */
     private fun markManualNavigation() {
         showReadingControls = false
         cancelReadingStart()
@@ -667,6 +690,7 @@ class ReaderActivity : FragmentActivity() {
         pendingStoppedProgress = null
     }
 
+    /** 放弃旧阅读定位与失败重试游标，重新跟随当前音频并恢复自动翻页。 */
     private fun followCurrentAudio() {
         cancelReadingStart()
         clearPendingAudioStart()
@@ -680,6 +704,7 @@ class ReaderActivity : FragmentActivity() {
         synchronizeAudio()
     }
 
+    /** 关闭跟随只改变偏好，不改变播放起点；重新开启时请求定位到当前朗读句。 */
     private fun toggleAudioFollow() {
         if (followingAudio) {
             followAudio = false
@@ -689,6 +714,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 取消未完成的正文起播查询并递增导航代次，让所有迟到定位结果失效。 */
     private fun cancelReadingStart() {
         readingStartJob?.cancel()
         readingStartJob = null
@@ -701,6 +727,7 @@ class ReaderActivity : FragmentActivity() {
         pendingAudioRequestId = null
     }
 
+    /** 按正文资源缓存匹配证据，避免每次定位扫描全书或长期保留所有章节的上下文。 */
     private fun anchorsFor(locator: Locator): List<SentenceLocatorMatcher.Anchor> {
         val book = speechBook ?: return emptyList()
         val href = locator.href.removeFragment().toString()
@@ -719,12 +746,13 @@ class ReaderActivity : FragmentActivity() {
         return book.sentences.getOrNull(index)
     }
 
+    /** 在当前资源的原始 DOM 中解析显式锚点，互斥复用解析器；失效锚点不回退到其他章节。 */
     private suspend fun resolveSourceSentence(locator: Locator, anchor: SourceSpeechAnchor): SpeechSentence? {
         val opened = publication ?: return null
         val book = speechBook ?: return null
         val candidates = anchorsFor(locator)
         if (candidates.isEmpty()) return null
-        // ResourceStart is an explicit table-of-contents request, never a fallback for a bad anchor.
+        // 资源起点只来自明确的无锚点目录选择，不能用于掩盖解析失败的锚点。
         if (anchor == SourceSpeechAnchor.ResourceStart) return book.sentences.getOrNull(candidates.first().index)
         val href = locator.href.removeFragment()
         val index = withContext(Dispatchers.IO) {
@@ -751,6 +779,7 @@ class ReaderActivity : FragmentActivity() {
 
     private fun playFromVisibleParagraph() = playFromReadingLocation(null)
 
+    /** 等待共享听书索引后，从目录目标或当前可见段落起播；查询完成前重验最新导航意图。 */
     private fun playFromReadingLocation(requested: Locator? = requestedReadingStart) {
         val fragment = navigator ?: return
         readingPlaybackIntent = ReadingPlaybackIntent.FROM_READING_LOCATION
@@ -785,6 +814,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 将选中文字等精确文本定位转换为句子起播，无法匹配时保留当前音频不擅自跳转。 */
     private fun playFromLocator(locator: Locator) {
         resumableProgress = null
         pendingStoppedProgress = null
@@ -800,8 +830,9 @@ class ReaderActivity : FragmentActivity() {
         requestAudioStart(ReadingProgress(bookId, sentence.locatorJson, sentence.index))
     }
 
+    /** 先登记唯一请求与等待游标，再发起服务命令，使同步失败和异步确认都关联正确操作。 */
     private fun requestAudioStart(progress: ReadingProgress) {
-        // Correlate the queued command before startService can publish or fail synchronously.
+        // startService 可能同步发布状态或失败，因此发送命令之前先建立请求关联。
         val requestId = PlaybackHub.newPlaybackSessionId()
         resumableProgress = null
         pendingStoppedProgress = null
@@ -814,6 +845,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 起播失败后保存目标及句内偏移，让重试沿用用户刚选的位置而非旧音频游标。 */
     private fun audioStartFailed(progress: ReadingProgress) {
         clearPendingAudioStart()
         readingPlaybackIntent = ReadingPlaybackIntent.RETRY_AUDIO_START
@@ -821,6 +853,7 @@ class ReaderActivity : FragmentActivity() {
         pendingStoppedProgress = progress
     }
 
+    /** 有停止或失败游标时优先恢复；否则从阅读页起播，索引未就绪时复用现有加载任务。 */
     private fun resumeOrPlayFromPage() {
         val saved = resumableProgress
         if (saved == null) {
@@ -850,6 +883,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 在系统选文菜单增加起播入口，查询与索引加载期间继续校验用户导航代次。 */
     private val selectionMenu = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
             markManualNavigation()
@@ -902,6 +936,7 @@ class ReaderActivity : FragmentActivity() {
         textColor = ReadiumColor(ink.toArgb()),
     )
 
+    /** 更新阅读偏好并异步落盘，再提交给 Readium，同时更新叠加界面和系统栏主题。 */
     private fun updateAppearance() {
         preferences.edit()
             .putFloat("font_scale", fontScale)
@@ -920,6 +955,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 保存视觉位置、跟随偏好与未完成起播关联，供配置变化后恢复同一阅读意图。 */
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString(STATE_LOCATOR, navigator?.currentLocator?.value?.toJSON()?.toString())
         outState.putBoolean(STATE_FOLLOW, followAudio)
@@ -942,18 +978,19 @@ class ReaderActivity : FragmentActivity() {
         super.onSaveInstanceState(outState)
     }
 
+    /** 在 WebView 可用时捕获最终位置；保存任务独立完成，并登记到书库以协调快速重开。 */
     override fun onPause() {
         navigator?.takeIf { canSaveReadingLocation() }?.let { fragment ->
             val page = fragment.currentLocator.value
-            // Resolve the visible paragraph while the WebView is still available, then perform
-            // the final AtomicFile write independently of the Activity's cancellation.
+            // 趁 WebView 仍可用先解析可见段落，再独立完成最终 AtomicFile 写入，
+            // 不让 Activity 的取消中断进度保存。
             val saveJob = lifecycleScope.launch(NonCancellable, start = CoroutineStart.LAZY) {
                 try {
                     saveReadingLocation(fragment, page, finalSave = true)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
-                    // A damaged optional listening index must not crash an otherwise readable EPUB.
+                    // 可选听书索引损坏不能导致仍可阅读的 EPUB 页面崩溃。
                     Log.w("FreeReadingReader", "Could not save the reading position", failure)
                 }
             }
@@ -963,12 +1000,13 @@ class ReaderActivity : FragmentActivity() {
         super.onPause()
     }
 
+    /** 先断开音频观察并移除旧导航 Fragment，再释放其持有的 Publication。 */
     override fun onDestroy() {
         audioBinding?.cancel()
         audioHighlighter = null
         navigator?.takeIf { it.isAdded && !supportFragmentManager.isDestroyed }?.let { fragment ->
-            // Restoration is handled by reopening the file, so discard the old Fragment's
-            // ViewModels even on rotation before releasing its Publication.
+            // 恢复时会重开文件，因此旋转屏幕也要在关闭 Publication 前
+            // 丢弃旧 Fragment 及其 ViewModel。
             supportFragmentManager.beginTransaction().remove(fragment).commitNowAllowingStateLoss()
         }
         super.onDestroy()
@@ -976,6 +1014,7 @@ class ReaderActivity : FragmentActivity() {
         publication = null
     }
 
+    /** 将当前书籍与音频状态映射为叠加菜单及独立听书弹层，关闭弹层不停止服务。 */
     @Composable
     private fun ReaderSurfaces() {
         val audio by PlaybackHub.state.collectAsStateWithLifecycle()
@@ -1043,11 +1082,12 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 仅对本书有效的相邻章节发送命令，同时作废旧阅读起播查询并保留跟随偏好。 */
     private fun skipListeningChapter(forward: Boolean) {
         val audio = PlaybackHub.state.value
         if (audio.bookId != bookId ||
             !(if (forward) audio.canGoToNextChapter else audio.canGoToPreviousChapter)) return
-        // An explicit audio chapter choice supersedes a pending selection/page lookup.
+        // 明确选择音频章节后，旧选文或页面定位任务不能再改变播放起点。
         cancelReadingStart()
         resumableProgress = null
         pendingStoppedProgress = null
@@ -1056,12 +1096,13 @@ class ReaderActivity : FragmentActivity() {
         if (forward) PlaybackHub.nextChapter(this, bookId) else PlaybackHub.previousChapter(this, bookId)
     }
 
+    /** 主播放操作按最新意图选择暂停、恢复或阅读定位起播；正文重开时已有音频仍可控制。 */
     private fun toggleListening() {
-        // The newest transport action supersedes a pending DOM/selection lookup.
+        // 最新的播放控制操作优先于尚未完成的 DOM 或选文定位。
         cancelReadingStart()
         val audio = PlaybackHub.state.value
         if (pendingStoppedProgress == null && (navigator == null || loading) && audio.bookId == bookId) {
-            // Existing audio remains usable while Readium reopens after recreation.
+            // 页面重建后 Readium 尚在重新打开时，已有音频会话仍可直接控制。
             PlaybackHub.toggle(this)
             return
         }
@@ -1083,6 +1124,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 先捕获本书句内游标并取消待起播任务，再结束服务，避免旧查询稍后重新播放。 */
     private fun stopListening() {
         cancelReadingStart()
         clearPendingAudioStart()
@@ -1117,10 +1159,11 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 以导航器的最新页面打开目录；同资源多锚点时异步解析 DOM，过期弹窗结果不再应用。 */
     private fun openContents() {
         val opened = publication ?: return
         val fragment = navigator ?: return
-        // The navigator has the latest page; the displayed locator is debounced for saving.
+        // 导航器保存最新页，界面显示的定位经过保存防抖，可能稍有滞后。
         val page = fragment.currentLocator.value
         val entries = flattenContents(opened.tableOfContents).ifEmpty {
             opened.readingOrder.mapIndexed { index, link -> ContentsEntry(link, 0, "第 ${index + 1} 节") }
@@ -1130,7 +1173,7 @@ class ReaderActivity : FragmentActivity() {
         val hasExactFragment = candidates.any { contentsFragment(it.value)?.let(fragments::contains) == true }
         val needsElement = !hasExactFragment && candidates.size > 1 &&
             candidates.any { contentsFragment(it.value) != null }
-        // A parent and a nested entry can share an anchor; keep the most specific alias.
+        // 父项与子项可能共用锚点，仅保留嵌套最深的别名参与边界判断。
         val boundaries = candidates.groupBy { contentsFragment(it.value) }.values.map { aliases ->
             val entry = aliases.maxBy { it.value.depth }
             entry.index to contentsFragment(entry.value)
@@ -1160,6 +1203,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 在原始 XHTML 中用可见元素判断当前目录边界，与句子定位共享互斥的资源解析缓存。 */
     private suspend fun resolveContentsAt(opened: Publication, locator: Locator,
                                          candidates: List<Pair<Int, String?>>): Int? {
         val anchor = (locator.locations["cssSelector"] as? String)?.takeIf(String::isNotBlank)
@@ -1180,6 +1224,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
+    /** 关闭目录并推进查询代次，防止迟到的解析结果影响下次打开。 */
     private fun dismissContents() {
         contentsGeneration += 1
         contentsJob?.cancel()
@@ -1261,6 +1306,7 @@ class ReaderActivity : FragmentActivity() {
         private const val STATE_STOPPED_PROGRESS = "reader_stopped_progress"
         private const val SELECTION_LISTEN_ID = 0x46524545
 
+        /** 构造指定书籍的阅读入口，可直接展开独立听书页。 */
         fun intent(context: Context, bookId: String, openPlayer: Boolean = false): Intent = Intent(context, ReaderActivity::class.java)
             .putExtra(EXTRA_BOOK_ID, bookId)
             .putExtra(EXTRA_OPEN_PLAYER, openPlayer)

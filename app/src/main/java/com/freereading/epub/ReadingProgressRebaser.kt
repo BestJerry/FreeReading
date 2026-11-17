@@ -19,10 +19,14 @@ import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.util.data.decodeString
 import org.readium.r2.shared.util.use
 
-/** Rebase one persisted cursor after rebuilding an index with the BOM-safe content parser. */
+/** 在使用兼容 BOM 的解析器重建索引后，将旧阅读／听书游标映射到新句子位置。 */
 internal object ReadingProgressRebaser {
     private val whitespace = Regex("\\s+")
 
+    /**
+     * 限定原资源，结合 CSS 选择器、旧 DOM 源码位置与文本上下文匹配新索引。
+     * 只有确认仍为同一句时才保留句内音频时间；证据不足时保守回退并归零音频时间。
+     */
     suspend fun rebase(publication: Publication, book: SpeechBook, saved: ReadingProgress,
                        legacySentence: SpeechSentence? = null): ReadingProgress =
         withContext(Dispatchers.IO) {
@@ -47,8 +51,8 @@ internal object ReadingProgressRebaser {
                             normalize(it.text.highlight.orEmpty()) == normalize(requireNotNull(legacySentence).text)
                     }
                 if (evidence != null) {
-                    // Reader progress stores a visual page and an independent speech index.
-                    // Rebase that old sentence, then retain the exact visual page for navigation.
+                    // 阅读进度中的页面定位与听书句子独立；
+                    // 先迁移旧句子，再保留精确的原页面供阅读导航使用。
                     return@withContext rebase(publication, book,
                         saved.copy(locatorJson = evidence.toJSON().toString(), audioOffsetMs = 0))
                         .copy(locatorJson = saved.locatorJson, audioOffsetMs = 0)
@@ -61,8 +65,8 @@ internal object ReadingProgressRebaser {
             if (html.isNullOrEmpty()) return@withContext moved(saved, sentences.first(), false, preserveLocator = true)
 
             val selector = (locator.locations["cssSelector"] as? String)?.takeIf(String::isNotBlank)
-            // Keep only this small token from the legacy DOM. Do not retain two whole parsed
-            // chapter documents while rebuilding a large book under the Android heap limit.
+            // 只保留旧 DOM 中这个小型标记，避免在 Android 堆限制下
+            // 同时保留两份完整章节文档。
             val legacyTag = if (html.startsWith('\uFEFF') && selector != null) legacyTag(html, selector) else null
             currentCoroutineContext().ensureActive()
             val document = Parser.htmlParser().setTrackPosition(true).parseInput(html.withoutLeadingHtmlBom(), "")
@@ -77,8 +81,8 @@ internal object ReadingProgressRebaser {
             val mappedBody = mapped?.takeIf { it.isInBody(document) }
             val targetText = normalize(locator.text.highlight.orEmpty())
             if (targetText.isEmpty()) {
-                // Reading saves a visual locator, independently from its speech sentence. It is
-                // already in browser coordinates; never apply a BOM child-index shift to it.
+                // 阅读保存的是浏览器坐标中的页面定位，与听书句子独立；
+                // 不能再对这种定位应用 BOM 导致的子节点编号偏移。
                 val first = direct?.let { scope(anchors, it).minByOrNull { anchor -> anchor.index } }
                     ?.index?.let { book.sentences.getOrNull(it) } ?: sentences.first()
                 return@withContext moved(saved, first, false, preserveLocator = true)
@@ -94,17 +98,20 @@ internal object ReadingProgressRebaser {
                     return@withContext moved(saved, result.sentence, result.sameSentence && !oldHeadOnly)
                 }
             }
-            // A discarded head/title locator can still name a real body heading. Restrict this
-            // fallback to the same resource, and never carry audio time from that synthetic title.
+            // 被丢弃的 head／title 定位仍可能对应真实的正文标题；
+            // 仅在同资源中回退匹配，且不继承这种合成标题的音频时间。
             match(anchors, locator, null, rawAfter, book)?.let { result ->
                 return@withContext moved(saved, result.sentence, result.sameSentence && !oldHeadOnly)
             }
             moved(saved, sentences.first(), false)
         }
 
+    /** 旧 DOM 元素在原始 HTML 中的位置与标签名，供移除开头 BOM 后重新对应元素。 */
     private data class SourceTag(val position: Int, val name: String)
+    /** 新句子匹配结果，以及是否有足够证据确认音频仍处于原来的同一句。 */
     private data class Match(val sentence: SpeechSentence, val sameSentence: Boolean)
 
+    /** 提取旧选择器指向的唯一元素的源码位置，不把整份旧 DOM 保留到后续处理。 */
     private fun legacyTag(html: String, selector: String): SourceTag? {
         val document = Parser.htmlParser().setTrackPosition(true).parseInput(html, "")
         val element = uniqueElement(document, selector) ?: return null
@@ -112,6 +119,7 @@ internal object ReadingProgressRebaser {
         return if (range.isTracked) SourceTag(range.start().pos(), element.normalName()) else null
     }
 
+    /** 尽量读取原章节作为定位证据；资源读取失败允许回退，但协程取消必须继续传播。 */
     private suspend fun readHtml(publication: Publication, chapter: Int): String? = try {
         publication.get(publication.readingOrder[chapter])?.use { resource ->
             resource.read().getOrNull()?.decodeString()?.getOrNull()
@@ -122,6 +130,7 @@ internal object ReadingProgressRebaser {
         null
     }
 
+    /** 将匹配范围收窄到目标元素的子树；行内元素没有独立锚点时使用最近块级祖先。 */
     private fun scope(anchors: List<SentenceLocatorMatcher.Anchor>, element: Element): List<SentenceLocatorMatcher.Anchor> {
         if (element.normalName() == "body") return anchors
         val selectors = element.getAllElements().mapTo(HashSet()) { it.cssSelector() }
@@ -132,6 +141,7 @@ internal object ReadingProgressRebaser {
         return anchors.filter { it.selector == parentSelector }
     }
 
+    /** 先筛文本和完整后文，再用上下文定位；重复文本未唯一确认时不保留句内时间。 */
     private fun match(
         candidates: List<SentenceLocatorMatcher.Anchor>,
         locator: Locator,
@@ -144,8 +154,8 @@ internal object ReadingProgressRebaser {
             normalize(anchor.text).let { it.isNotEmpty() && (it.contains(targetText) || targetText.contains(it)) }
         }
         if (textMatches.isEmpty()) return null
-        // Full sentence locators retain the exact remaining source text, even if the matching
-        // helper only needs 160 characters. Its length disambiguates repeated sentences cheaply.
+        // 完整句子定位保留精确的剩余原文，即使匹配器只使用其中 160 个字符；
+        // 可利用完整后文的长度与内容，低成本区分重复句子。
         val exactRanges = if (rawAfter == null) emptyList() else textMatches.filter { anchor ->
             book.sentences.getOrNull(anchor.index)?.let { afterMatches(it, rawAfter) } == true
         }
@@ -160,6 +170,7 @@ internal object ReadingProgressRebaser {
         return Match(sentence, sameText && verifiedRange)
     }
 
+    /** 直接比较共享片段剩余文本和后缀，避免为每个候选句创建完整 after 字符串。 */
     private fun afterMatches(sentence: SpeechSentence, after: String): Boolean {
         val source = sentence.source ?: return false
         val suffix = source.locator.text.after.orEmpty()
@@ -169,6 +180,7 @@ internal object ReadingProgressRebaser {
             suffix.regionMatches(0, after, remaining, suffix.length)
     }
 
+    /** 统一生成迁移进度，可保留原阅读页，但只有同句匹配才继承音频偏移。 */
     private fun moved(saved: ReadingProgress, sentence: SpeechSentence, sameSentence: Boolean,
                       preserveLocator: Boolean = false): ReadingProgress = saved.copy(
         sentenceIndex = sentence.index,
@@ -176,6 +188,7 @@ internal object ReadingProgressRebaser {
         audioOffsetMs = if (sameSentence) saved.audioOffsetMs.coerceAtLeast(0) else 0,
     )
 
+    /** 无可靠定位时将旧句子序号限制到新索引合法范围，并清除不再可信的句内时间。 */
     private fun fallback(book: SpeechBook, saved: ReadingProgress, preserveLocator: Boolean = false): ReadingProgress =
         moved(saved, book.sentences[saved.sentenceIndex.coerceIn(book.sentences.indices)], false, preserveLocator)
 
