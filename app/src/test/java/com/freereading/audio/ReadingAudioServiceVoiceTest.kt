@@ -125,6 +125,7 @@ class ReadingAudioServiceVoiceTest {
     @Test fun pausedSwitchKeepsTheSentenceSessionAndSpeedAndMapsItsRelativePosition() {
         activeFixture(playing = false)
         val sessionId = PlaybackHub.state.value.playbackSessionId
+        val followRequest = PlaybackHub.state.value.followRequestId
         ServiceVoiceTtsShadow.holdSynthesis = true
         select(chosenId)
         await("new voice synthesis") { ServiceVoiceTtsShadow.calls.isNotEmpty() }
@@ -139,6 +140,7 @@ class ReadingAudioServiceVoiceTest {
         assertEquals(10_000L, player.currentPosition)
         assertEquals(20_000L, PlaybackHub.state.value.durationMs)
         assertEquals(sessionId, PlaybackHub.state.value.playbackSessionId)
+        assertEquals(followRequest, PlaybackHub.state.value.followRequestId)
         assertFalse(player.playWhenReady)
         assertEquals(1.25f, player.playbackParameters.speed, 0f)
         assertEquals(1, player.mediaItemCount) // The next speculative synthesis is held.
@@ -149,6 +151,7 @@ class ReadingAudioServiceVoiceTest {
 
     @Test fun pauseAndSpeedDuringSwitchRemainTheLatestPlaybackIntent() {
         activeFixture(playing = true)
+        val followRequest = PlaybackHub.state.value.followRequestId
         ServiceVoiceTtsShadow.holdSynthesis = true
         select(chosenId)
         await("held new voice") { ServiceVoiceTtsShadow.calls.isNotEmpty() }
@@ -163,6 +166,7 @@ class ReadingAudioServiceVoiceTest {
         assertEquals(1.75f, player.playbackParameters.speed, 0f)
         assertEquals(1.75f, PlaybackHub.state.value.speed, 0f)
         assertEquals(1, PlaybackHub.state.value.sentenceIndex)
+        assertEquals(followRequest, PlaybackHub.state.value.followRequestId)
     }
 
     @Test fun switchingCancelsAndJoinsOldVoicePrefetchBeforeSynthesizingTheCurrentSentence() {
@@ -330,7 +334,7 @@ class ReadingAudioServiceVoiceTest {
         ReflectionHelpers.setField(service, "transitionToken", null)
         PlaybackHub.publish(PlaybackSnapshot(bookId = "book-a", bookTitle = "测试书籍", sentenceIndex = 1,
             sentenceCount = 4, text = "句子1。", positionMs = 5_000, durationMs = 10_000,
-            speed = 1.25f, playbackSessionId = PlaybackHub.newPlaybackSessionId()))
+            speed = 1.25f, playbackSessionId = PlaybackHub.newPlaybackSessionId(), followRequestId = "fixture-start"))
     }
 
     private fun load(bookId: String = "book-a") {

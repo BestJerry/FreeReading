@@ -173,7 +173,7 @@ class ReaderActivityAsyncTest {
         } finally { controller.destroy() }
     }
 
-    @Test fun resumingSavedAudioKeepsAnExplicitlyDisabledAutomaticPagingPreference() {
+    @Test fun resumingSavedAudioReenablesAutomaticPagingAndKeepsItsChosenPosition() {
         val app = RuntimeEnvironment.getApplication() as ReadingApplication
         val controller = Robolectric.buildActivity(ReaderActivity::class.java,
             ReaderActivity.intent(app, "reader-async-probe")).create()
@@ -184,13 +184,39 @@ class ReaderActivityAsyncTest {
 
             ReflectionHelpers.callInstanceMethod<Unit>(controller.get(), "resumeOrPlayFromPage")
 
-            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(controller.get(), "getFollowAudio"))
-            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(controller.get(), "getFollowingAudio"))
+            assertTrue(ReflectionHelpers.callInstanceMethod<Boolean>(controller.get(), "getFollowAudio"))
+            assertTrue(ReflectionHelpers.callInstanceMethod<Boolean>(controller.get(), "getFollowingAudio"))
             val started = shadowOf(app).nextStartedService
             assertEquals(ReadingAudioService.ACTION_PLAY_BOOK, started?.action)
             assertEquals(7, started?.getIntExtra(ReadingAudioService.EXTRA_INDEX, -1))
             assertEquals(6_000L, started?.getLongExtra(ReadingAudioService.EXTRA_POSITION, -1))
         } finally { controller.destroy() }
+    }
+
+    @Test fun recreationDoesNotReconsumeAStartAfterTheUserClosesFollowButANewResumeRestoresIt() {
+        val app = RuntimeEnvironment.getApplication() as ReadingApplication
+        val intent = ReaderActivity.intent(app, "reader-async-probe")
+        val controller = Robolectric.buildActivity(ReaderActivity::class.java, intent).create()
+        val saved = Bundle()
+        PlaybackHub.publish(PlaybackSnapshot(bookId = "reader-async-probe", followRequestId = PlaybackHub.newFollowRequestId()))
+        try {
+            ReflectionHelpers.callInstanceMethod<Unit>(controller.get(), "synchronizeAudio")
+            ReflectionHelpers.callInstanceMethod<Unit>(controller.get(), "toggleAudioFollow")
+            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(controller.get(), "getFollowingAudio"))
+            controller.saveInstanceState(saved)
+        } finally { controller.destroy() }
+        val recreated = Robolectric.buildActivity(ReaderActivity::class.java, intent).create(saved)
+        try {
+            ReflectionHelpers.callInstanceMethod<Unit>(recreated.get(), "synchronizeAudio")
+            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(recreated.get(), "getFollowingAudio"))
+            val nextFollowRequest = PlaybackHub.newFollowRequestId()
+            PlaybackHub.publish(PlaybackSnapshot(bookId = "another-book", followRequestId = nextFollowRequest))
+            ReflectionHelpers.callInstanceMethod<Unit>(recreated.get(), "synchronizeAudio")
+            assertFalse(ReflectionHelpers.callInstanceMethod<Boolean>(recreated.get(), "getFollowingAudio"))
+            PlaybackHub.publish(PlaybackSnapshot(bookId = "reader-async-probe", followRequestId = nextFollowRequest))
+            ReflectionHelpers.callInstanceMethod<Unit>(recreated.get(), "synchronizeAudio")
+            assertTrue(ReflectionHelpers.callInstanceMethod<Boolean>(recreated.get(), "getFollowingAudio"))
+        } finally { recreated.destroy() }
     }
 
     @Test fun recreationKeepsAChosenReadingLocationDetachedWhileRememberingAutomaticPagingIsEnabled() {

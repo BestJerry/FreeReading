@@ -11,6 +11,9 @@ import com.freereading.ReadingApplication
 import com.freereading.audio.PlaybackHub
 import com.freereading.audio.PlaybackSnapshot
 import com.freereading.audio.PlaybackStartFailure
+import com.freereading.audio.ReadingAudioService
+import com.freereading.audio.ChapterProgressIndex
+import androidx.media3.exoplayer.ExoPlayer
 import com.freereading.data.ReadingProgress
 import com.freereading.data.SpeechBook
 import com.freereading.data.SpeechSentence
@@ -52,6 +55,7 @@ import org.robolectric.util.ReflectionHelpers.ClassParameter
 /** Actual Activity/Readium view lifecycle and decoration submissions; WebView does not execute JS. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], application = ReadingApplication::class)
+@androidx.annotation.OptIn(markerClass = [androidx.media3.common.util.UnstableApi::class])
 class ReaderHighlightLifecycleTest {
     private lateinit var app: ReadingApplication
     private lateinit var book: SpeechBook
@@ -345,28 +349,176 @@ class ReaderHighlightLifecycleTest {
         await("same-index playback start navigation") { jumps.lastOrNull() == locator(1) }
     }
 
-    @Test fun explicitlyDisablingAutomaticPagingSurvivesANewStartAndForegroundRebinding() {
+    @Test fun aNewStartRestoresFollowingButLaterManualDisableSurvivesForegroundRebinding() {
         val jumps = recordNavigation()
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "followCurrentAudio")
         pageListener().onPageLoaded()
         await("initial audio location") { jumps.isNotEmpty() }
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "toggleAudioFollow")
         assertFalse(following())
-        val pausedJumps = jumps.size
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "startSentence",
             ClassParameter.from(SpeechSentence::class.java, book.sentences[2]))
         val acceptedRequest = pendingRequestId()
-        PlaybackHub.publish(snapshot(2).copy(isPlaying = true, playbackSessionId = acceptedRequest))
-        await("highlight with automatic paging disabled") { decorations().singleOrNull()?.locator == locator(2) }
+        assertTrue(following())
+        val followRequest = PlaybackHub.newFollowRequestId()
+        PlaybackHub.publish(snapshot(2).copy(isPlaying = true, playbackSessionId = acceptedRequest,
+            followRequestId = followRequest))
+        await("new start restores automatic paging") { jumps.lastOrNull() == locator(2) }
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "toggleAudioFollow")
         assertFalse(following())
+        val pausedJumps = jumps.size
         requireNotNull(controller).pause().stop()
         await("background worker stop") { highlighter() == null }
         requireNotNull(controller).start().resume()
         await("foreground worker restart") { highlighter() != null }
-        PlaybackHub.publish(snapshot(3).copy(isPlaying = true, playbackSessionId = acceptedRequest))
+        PlaybackHub.publish(snapshot(3).copy(isPlaying = true, playbackSessionId = acceptedRequest,
+            followRequestId = followRequest))
         await("foreground disabled highlight") { decorations().singleOrNull()?.locator == locator(3) }
         assertEquals(pausedJumps, jumps.size)
         assertFalse(following())
+    }
+
+    @Test fun aResumeEventRestoresFollowWithoutCancellingPendingReadingWorkOrReenablingItOnNaturalTransitions() {
+        val jumps = recordNavigation()
+        pageListener().onPageLoaded()
+        await("initial detached highlight") { decorations().isNotEmpty() }
+        val pending = Job()
+        ReflectionHelpers.setField(activity, "readingStartJob", pending)
+        val request = PlaybackHub.newPlaybackSessionId()
+        val followRequest = PlaybackHub.newFollowRequestId()
+        ReflectionHelpers.setField(activity, "pendingAudioSentence", 3)
+        ReflectionHelpers.setField(activity, "pendingAudioRequestId", request)
+        try {
+            PlaybackHub.publish(snapshot(2).copy(playbackSessionId = "older-session",
+                followRequestId = followRequest, isPreparing = true))
+            await("resume enables following") { following() }
+            assertFalse(pending.isCancelled)
+            assertEquals(3, ReflectionHelpers.getField<Int?>(activity, "pendingAudioSentence"))
+            assertTrue("Unconfirmed old session must not navigate", jumps.isEmpty())
+
+            PlaybackHub.publish(snapshot(3).copy(playbackSessionId = request,
+                followRequestId = followRequest, isPlaying = true))
+            await("confirmed resumed cursor") { jumps.lastOrNull() == locator(3) }
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "toggleAudioFollow")
+            val before = jumps.size
+            // Natural sentence changes, buffering and speed updates retain this start's ID.
+            for (state in listOf(
+                snapshot(1).copy(followRequestId = followRequest, isPreparing = true),
+                snapshot(1).copy(followRequestId = followRequest, isPlaying = true, speed = 1.5f),
+                snapshot(2).copy(followRequestId = followRequest, isPlaying = true),
+            )) {
+                PlaybackHub.publish(state)
+                await("current disabled-follow highlight") { decorations().singleOrNull()?.locator == locator(state.sentenceIndex) }
+                assertFalse(following())
+                assertEquals(before, jumps.size)
+            }
+
+            PlaybackHub.publish(snapshot(2).copy(followRequestId = PlaybackHub.newFollowRequestId(), isPlaying = true))
+            await("new resume enables automatic paging again") { following() && jumps.size > before }
+        } finally { pending.cancel() }
+    }
+
+    @Test fun aStartWaitsForItsResolvedSentenceBeforeNavigatingTheOriginalText() {
+        val jumps = recordNavigation()
+        pageListener().onPageLoaded()
+        await("initial highlight") { decorations().isNotEmpty() }
+
+        val followRequest = PlaybackHub.newFollowRequestId()
+        PlaybackHub.publish(PlaybackSnapshot(bookId = book.book.id, sentenceIndex = 0,
+            isPreparing = true, followRequestId = followRequest))
+        await("follow request consumed") { following() && decorations().isEmpty() }
+        assertTrue("Placeholder sentence zero is not the restored target", jumps.isEmpty())
+
+        // Count is the only cursor change when the resolved saved target is also sentence zero.
+        PlaybackHub.publish(snapshot(0).copy(isPreparing = true, followRequestId = followRequest))
+        await("resolved sentence zero navigation") { jumps.lastOrNull() == locator(0) }
+    }
+
+    @Test fun manuallyDisablingFollowAcknowledgesANewEventBeforeItsCollectorRuns() {
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "followCurrentAudio")
+        PlaybackHub.publish(snapshot(2).copy(followRequestId = PlaybackHub.newFollowRequestId(), isPlaying = true))
+
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "toggleAudioFollow")
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "synchronizeAudio")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertFalse(following())
+    }
+
+    @Test fun manuallyDisablingFollowAfterSubmittingStartSurvivesDelayedServiceAcceptance() {
+        assertManualOperationSurvivesDelayedStart(manualNavigation = false)
+    }
+
+    @Test fun manuallyBrowsingAfterSubmittingStartSurvivesDelayedServiceAcceptance() {
+        assertManualOperationSurvivesDelayedStart(manualNavigation = true)
+    }
+
+    @Test fun manuallyClosingFollowSurvivesADelayedResumeCommand() {
+        assertManualOperationSurvivesDelayedStart(manualNavigation = false, ReadingAudioService.ACTION_TOGGLE)
+    }
+
+    @Test fun manuallyBrowsingSurvivesBothDelayedChapterCommands() {
+        for (action in listOf(ReadingAudioService.ACTION_NEXT_CHAPTER, ReadingAudioService.ACTION_PREVIOUS_CHAPTER)) {
+            assertManualOperationSurvivesDelayedStart(manualNavigation = true, action)
+        }
+    }
+
+    @Test fun manuallyClosingFollowSurvivesBothDelayedSentenceCommands() {
+        for (action in listOf(ReadingAudioService.ACTION_NEXT, ReadingAudioService.ACTION_PREVIOUS)) {
+            assertManualOperationSurvivesDelayedStart(manualNavigation = false, action)
+        }
+    }
+
+    private fun assertManualOperationSurvivesDelayedStart(manualNavigation: Boolean,
+                                                         action: String = ReadingAudioService.ACTION_PLAY_BOOK) {
+        val serviceController = Robolectric.buildService(ReadingAudioService::class.java).create()
+        val service = serviceController.get()
+        try {
+            shadowOf(app).clearStartedServices()
+            if (action == ReadingAudioService.ACTION_PLAY_BOOK) {
+                ReflectionHelpers.callInstanceMethod<Unit>(activity, "startSentence",
+                    ClassParameter.from(SpeechSentence::class.java, book.sentences[2]))
+            } else {
+                val middleChapter = book.sentences.map { it.chapterIndex }.distinct()[1]
+                val index = book.sentences.first { it.chapterIndex == middleChapter }.index
+                ReflectionHelpers.setField(service, "book", book)
+                ReflectionHelpers.setField(service, "chapterProgressIndex", ChapterProgressIndex(book.sentences))
+                val player: ExoPlayer = ReflectionHelpers.getField(service, "player")
+                player.playWhenReady = action == ReadingAudioService.ACTION_NEXT || action == ReadingAudioService.ACTION_PREVIOUS
+                PlaybackHub.publish(snapshot(index))
+                ReflectionHelpers.callInstanceMethod<Unit>(activity, "followCurrentAudio")
+                when (action) {
+                    ReadingAudioService.ACTION_TOGGLE -> PlaybackHub.toggle(app)
+                    ReadingAudioService.ACTION_NEXT -> PlaybackHub.next(app)
+                    ReadingAudioService.ACTION_PREVIOUS -> PlaybackHub.previous(app)
+                    ReadingAudioService.ACTION_NEXT_CHAPTER -> PlaybackHub.nextChapter(app, book.book.id)
+                    ReadingAudioService.ACTION_PREVIOUS_CHAPTER -> PlaybackHub.previousChapter(app, book.book.id)
+                }
+            }
+            val submitted = requireNotNull(shadowOf(app).nextStartedService)
+            assertEquals(action, submitted.action)
+            assertTrue(following())
+            // Robolectric 保留真实 Hub Intent，但尚未交给 Service，确定性复现命令提交后的用户操作。
+            ReflectionHelpers.callInstanceMethod<Unit>(activity,
+                if (manualNavigation) "markManualNavigation" else "toggleAudioFollow")
+            assertFalse(following())
+
+            service.onStartCommand(submitted, 0, 1)
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "synchronizeAudio")
+
+            assertEquals("服务必须沿用提交前签发的跟随标识",
+                submitted.getStringExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID), PlaybackHub.state.value.followRequestId)
+            assertFalse("服务迟到接受旧命令不能覆盖更新的手动操作", following())
+            PlaybackHub.playBook(app, book.book.id, 3)
+            val resumed = requireNotNull(shadowOf(app).nextStartedService)
+            service.onStartCommand(resumed, 0, 2)
+            ReflectionHelpers.callInstanceMethod<Unit>(activity, "synchronizeAudio")
+            assertTrue("下一次新提交的朗读仍应开启跟随", following())
+        } finally {
+            // 防止销毁路径将本测试不关注的音频进度写回临时书籍。
+            ReflectionHelpers.setField(service, "book", null)
+            serviceController.destroy()
+        }
     }
 
     @Test fun aPendingStartBlocksAnEarlierNavigationUntilTheServiceConfirmsTheNewSentence() {

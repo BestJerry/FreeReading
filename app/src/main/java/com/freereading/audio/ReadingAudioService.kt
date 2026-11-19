@@ -198,20 +198,20 @@ class ReadingAudioService : MediaSessionService() {
                 if (id.isNullOrBlank()) { stopPlayback(); return START_NOT_STICKY }
                 playBook(id, intent.getIntExtra(EXTRA_INDEX, -1),
                     intent.getLongExtra(EXTRA_POSITION, 0),
-                    requestId ?: PlaybackHub.newPlaybackSessionId())
+                    requestId ?: PlaybackHub.newPlaybackSessionId(), PlaybackHub.followRequestId(intent))
             }
             ACTION_TOGGLE -> requestPlayback(if (player.playbackState == Player.STATE_ENDED)
-                true else !player.playWhenReady)
+                true else !player.playWhenReady, PlaybackHub.followRequestId(intent))
             ACTION_SEEK_BY -> seekBy(intent.getLongExtra(EXTRA_DELTA, 0))
             ACTION_SPEED -> {
                 val speed = intent.getFloatExtra(EXTRA_SPEED, 1f)
                 if (speed.isFinite()) player.setPlaybackSpeed(speed.coerceIn(0.5f, 2f))
                 refreshSnapshot()
             }
-            ACTION_NEXT -> moveRelative(1)
-            ACTION_PREVIOUS -> moveRelative(-1)
-            ACTION_NEXT_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), 1)
-            ACTION_PREVIOUS_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), -1)
+            ACTION_NEXT -> moveRelative(1, PlaybackHub.followRequestId(intent))
+            ACTION_PREVIOUS -> moveRelative(-1, PlaybackHub.followRequestId(intent))
+            ACTION_NEXT_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), 1, PlaybackHub.followRequestId(intent))
+            ACTION_PREVIOUS_CHAPTER -> moveChapter(intent.getStringExtra(EXTRA_BOOK_ID), -1, PlaybackHub.followRequestId(intent))
             ACTION_STOP -> stopPlayback()
             ACTION_LOAD_VOICES, ACTION_SELECT_VOICE -> handleVoiceRequest(intent)
             else -> return super.onStartCommand(intent, flags, startId)
@@ -336,14 +336,15 @@ class ReadingAudioService : MediaSessionService() {
 
     /** 建立新的起播会话，后台读取索引；负索引恢复保存的位置，显式索引则从指定句内位置播放。 */
     private fun playBook(id: String, index: Int, offsetMs: Long,
-                         playbackSessionId: String = PlaybackHub.newPlaybackSessionId()) {
+                         playbackSessionId: String = PlaybackHub.newPlaybackSessionId(),
+                         followRequestId: String = PlaybackHub.newFollowRequestId()) {
         relativeSeeks.clear()
         val previousProgress = captureProgress()
         book = null
         PlaybackHub.publish(PlaybackSnapshot(bookId = id,
             bookTitle = repository.books.value.firstOrNull { it.id == id }?.title.orEmpty(),
             sentenceIndex = index.coerceAtLeast(0), speed = player.playbackParameters.speed,
-            playbackSessionId = playbackSessionId))
+            playbackSessionId = playbackSessionId, followRequestId = followRequestId))
         player.playWhenReady = true
         beginTransition { token ->
             previousProgress?.let { persist(it) }
@@ -364,14 +365,15 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     /** 跳到绝对句子位置并替换旧任务；章节按钮可明确要求开播，普通跳转保留当前播放意图。 */
-    private fun moveTo(index: Int, positionMs: Long, startPlaying: Boolean = false) {
+    private fun moveTo(index: Int, positionMs: Long, startPlaying: Boolean = false,
+                       restoreFollow: Boolean = false, followRequestId: String? = null) {
         val currentBook = book ?: return
         relativeSeeks.clear()
         val progress = captureProgress()
         val target = index.coerceIn(0, currentBook.sentences.lastIndex)
         // 保存进度或合成音频前先发布目标，让连续点击从待播放句继续计算，
         // 避免旧播放器位置导致每次点击都跳向同一个目标。
-        publishPreparing(currentBook, target, positionMs)
+        publishPreparing(currentBook, target, positionMs, restoreFollow, followRequestId)
         beginTransition(playWhenReady = if (startPlaying) true else null) { token ->
             progress?.let { persist(it) }
             openSentence(currentBook, target, positionMs, token)
@@ -400,29 +402,42 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     /** 处理系统媒体的上一项／下一项，仍按句子切换并保留播放／暂停状态。 */
-    private fun moveRelative(delta: Int) {
+    private fun moveRelative(delta: Int, followRequestId: String? = null) {
         val currentBook = book ?: return
         val target = currentIndex() + delta
-        if (target in currentBook.sentences.indices) moveTo(target, 0)
+        if (target in currentBook.sentences.indices) {
+            moveTo(target, 0, restoreFollow = player.playWhenReady, followRequestId = followRequestId)
+        }
     }
 
     /** 仅允许当前书籍跳至相邻章首并播放；首末章没有目标时不重启当前音频。 */
-    private fun moveChapter(requestedBookId: String?, delta: Int) {
+    private fun moveChapter(requestedBookId: String?, delta: Int, followRequestId: String? = null) {
         val currentBook = book ?: return
         if (requestedBookId != currentBook.book.id) return
         val chapters = chapterProgressIndex ?: return
         val index = currentIndex().coerceIn(currentBook.sentences.indices)
         val target = if (delta < 0) chapters.previousChapterStart(index) else chapters.nextChapterStart(index)
-        if (target != null) moveTo(target, 0, startPlaying = true)
+        if (target != null) moveTo(target, 0, startPlaying = true, restoreFollow = true,
+            followRequestId = followRequestId)
     }
 
     /** 记录最新播放意图；暂停立即生效，恢复时可重建失败、空队列或已结束的当前句。 */
-    private fun requestPlayback(play: Boolean) {
+    private fun requestPlayback(play: Boolean, followRequestId: String? = null) {
+        val restarting = transitionToken == null && book != null &&
+            (player.playerError != null || player.mediaItemCount == 0 || player.playbackState == Player.STATE_ENDED)
+        val restoreFollow = play && (!player.playWhenReady || restarting) &&
+            (book != null || (transitionToken != null && PlaybackHub.state.value.isPreparing))
         player.playWhenReady = play
         if (!play) { refreshSnapshot(); saveCurrentLater(); return }
         if (book == null && transitionToken == null) {
-            PlaybackHub.state.value.bookId?.let { playBook(it, -1, 0) }
+            PlaybackHub.state.value.bookId?.let {
+                playBook(it, -1, 0, followRequestId = followRequestId ?: PlaybackHub.newFollowRequestId())
+            }
             return
+        }
+        if (restoreFollow) {
+            PlaybackHub.publish(PlaybackHub.state.value.copy(
+                followRequestId = followRequestId ?: PlaybackHub.newFollowRequestId()))
         }
         if (transitionToken == null && book != null &&
             (player.playerError != null || player.mediaItemCount == 0 ||
@@ -583,11 +598,13 @@ class ReadingAudioService : MediaSessionService() {
     }
 
     /** 合成前发布目标句、位置及章节边界，让原文跟随与连续章节操作使用同一待播放游标。 */
-    private fun publishPreparing(currentBook: SpeechBook, index: Int, positionMs: Long) {
+    private fun publishPreparing(currentBook: SpeechBook, index: Int, positionMs: Long,
+                                 restoreFollow: Boolean = false, followRequestId: String? = null) {
         val sentence = currentBook.sentences[index]
         val duration = clips[index]?.durationMs ?: 0
         val chapter = chapterProgressIndex?.at(index, positionMs, duration)
-        PlaybackHub.publish(PlaybackHub.state.value.copy(bookId = currentBook.book.id,
+        val old = PlaybackHub.state.value
+        PlaybackHub.publish(old.copy(bookId = currentBook.book.id,
             bookTitle = currentBook.book.title, sentenceIndex = index,
             sentenceCount = currentBook.sentences.size, chapterTitle = sentence.chapterTitle,
             text = sentence.text, positionMs = positionMs.coerceAtLeast(0), durationMs = duration,
@@ -595,6 +612,7 @@ class ReadingAudioService : MediaSessionService() {
             chapterSentenceCount = chapter?.sentenceCount ?: 0,
             canGoToPreviousChapter = chapterProgressIndex?.previousChapterStart(index) != null,
             canGoToNextChapter = chapterProgressIndex?.nextChapterStart(index) != null,
+            followRequestId = if (restoreFollow) followRequestId ?: PlaybackHub.newFollowRequestId() else old.followRequestId,
             isPreparing = true, isPlaying = false, error = null, needsVoiceData = false))
     }
 
@@ -775,6 +793,7 @@ class ReadingAudioService : MediaSessionService() {
         internal const val EXTRA_INDEX = "sentence_index"
         internal const val EXTRA_POSITION = "position_ms"
         internal const val EXTRA_PLAYBACK_SESSION_ID = "playback_session_id"
+        internal const val EXTRA_FOLLOW_REQUEST_ID = "follow_request_id"
         internal const val EXTRA_DELTA = "delta_ms"
         internal const val EXTRA_SPEED = "speed"
         internal const val EXTRA_LANGUAGE = "language"

@@ -29,6 +29,41 @@ class PlaybackHubStartRequestTest {
         PlaybackHub.publish(PlaybackSnapshot())
     }
 
+    @Test fun aManualFollowWatermarkRejectsEarlierSubmittedCommandsButAllowsTheNextStart() {
+        val submitted = PlaybackHub.newFollowRequestId()
+        val manualOperation = PlaybackHub.newFollowRequestId()
+        val nextStart = PlaybackHub.newFollowRequestId()
+
+        assertFalse(PlaybackHub.isNewerFollowRequest(submitted, manualOperation))
+        assertFalse(PlaybackHub.isNewerFollowRequest(manualOperation, manualOperation))
+        assertTrue(PlaybackHub.isNewerFollowRequest(nextStart, manualOperation))
+        assertTrue(PlaybackHub.isNewerFollowRequest(nextStart, "old-process:999"))
+        assertFalse(PlaybackHub.isNewerFollowRequest("old-process:999", nextStart))
+        val namespace = nextStart.substringBefore(':')
+        for (id in listOf(null, "", "$namespace:0", "$namespace:01", "$namespace:-1",
+            "$namespace:invalid", "$namespace:${Long.MAX_VALUE}")) {
+            assertFalse("Malformed or unissued event: $id", PlaybackHub.isNewerFollowRequest(id, null))
+        }
+    }
+
+    @Test fun allCommandsThatCanStartSpeechCarryTheirOriginalSubmissionOrder() {
+        val app = RuntimeEnvironment.getApplication() as ReadingApplication
+        val actions = listOf(ReadingAudioService.ACTION_PLAY_BOOK, ReadingAudioService.ACTION_TOGGLE,
+            ReadingAudioService.ACTION_NEXT, ReadingAudioService.ACTION_PREVIOUS,
+            ReadingAudioService.ACTION_NEXT_CHAPTER, ReadingAudioService.ACTION_PREVIOUS_CHAPTER)
+        var earlier: String? = null
+        for (action in actions) {
+            val command = PlaybackHub.command(app, action)
+            val submitted = command.getStringExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID)
+            assertTrue("Command must be ordered before submission: $action",
+                PlaybackHub.isNewerFollowRequest(submitted, earlier))
+            assertEquals(submitted, PlaybackHub.followRequestId(command))
+            earlier = submitted
+        }
+        assertFalse(PlaybackHub.command(app, ReadingAudioService.ACTION_SEEK_BY)
+            .hasExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID))
+    }
+
     @Test fun anEarlierOutstandingStartCannotConfirmANewerRequest() {
         val earlier = PlaybackHub.newPlaybackSessionId()
         val requested = PlaybackHub.newPlaybackSessionId()

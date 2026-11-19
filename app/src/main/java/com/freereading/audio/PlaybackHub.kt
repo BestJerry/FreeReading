@@ -38,6 +38,8 @@ data class PlaybackSnapshot(
     val needsVoiceData: Boolean = false,
     // 服务接受起播请求时设置新的会话 ID，自然换句沿用；结束会话时清空。
     val playbackSessionId: String? = null,
+    // 仅明确开始／恢复朗读时更新；阅读页消费一次后，本次播放内的手动关闭仍有效。
+    val followRequestId: String? = null,
     val startFailure: PlaybackStartFailure? = null,
     val canGoToPreviousChapter: Boolean = false,
     val canGoToNextChapter: Boolean = false,
@@ -53,6 +55,9 @@ object PlaybackHub {
     // 请求标识需要体现顺序，使用独立命名空间，避免泄露私有命令令牌。
     private val playbackSessionNamespace = UUID.randomUUID().toString()
     private val playbackSessionSequence = AtomicLong()
+    // 跟随事件按命令提交顺序编号；手动操作用同一序列记录水位，拦住迟到服务命令。
+    private val followRequestNamespace = UUID.randomUUID().toString()
+    private val followRequestSequence = AtomicLong()
     private val mutableState = MutableStateFlow(PlaybackSnapshot())
     val state: StateFlow<PlaybackSnapshot> = mutableState.asStateFlow()
     private val mutableVoiceState = MutableStateFlow(TtsVoiceUiState())
@@ -81,6 +86,32 @@ object PlaybackHub {
     /** 生成进程内有序起播标识，用于确认服务接受的是当前或更新的起播请求。 */
     internal fun newPlaybackSessionId(): String =
         "$playbackSessionNamespace:${playbackSessionSequence.incrementAndGet()}"
+
+    /** 跟随请求独立于起播确认；也用于登记手动操作水位，不改变待确认的播放会话。 */
+    internal fun newFollowRequestId(): String =
+        "$followRequestNamespace:${followRequestSequence.incrementAndGet()}"
+
+    /** 仅较新的本进程事件可恢复跟随；重建页面中的旧进程水位不屏蔽新起播。 */
+    internal fun isNewerFollowRequest(requestId: String?, handledId: String?): Boolean {
+        val requested = followRequestSequenceOf(requestId) ?: return false
+        val handled = followRequestSequenceOf(handledId) ?: return true
+        return requested > handled
+    }
+
+    private fun followRequestSequenceOf(id: String?): Long? {
+        val prefix = "$followRequestNamespace:"
+        if (id == null || !id.startsWith(prefix)) return null
+        val suffix = id.removePrefix(prefix)
+        val sequence = suffix.toLongOrNull() ?: return null
+        return sequence.takeIf {
+            it > 0 && it <= followRequestSequence.get() && it.toString() == suffix
+        }
+    }
+
+    /** 私有命令缺少有效标识时现场补发；正常命令沿用提交前签发的标识。 */
+    internal fun followRequestId(intent: Intent): String =
+        intent.getStringExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID)
+            ?.takeIf { followRequestSequenceOf(it) != null } ?: newFollowRequestId()
 
     internal fun isCurrentPlaybackSessionId(id: String?): Boolean = playbackSessionSequenceOf(id) != null
 
@@ -176,9 +207,17 @@ object PlaybackHub {
             .putFloat("speed", speed).apply()
     }
     /** 构造带进程内令牌的应用私有命令；系统媒体会话走另一条可信控制入口。 */
-    internal fun command(context: Context, action: String) =
+    internal fun command(context: Context, action: String): Intent =
         Intent(context.applicationContext, ReadingAudioService::class.java).setAction(action)
-            .putExtra(EXTRA_COMMAND_TOKEN, commandToken)
+            .putExtra(EXTRA_COMMAND_TOKEN, commandToken).also { intent ->
+                // 服务接收可能晚于用户再次关闭跟随，必须在提交前确定事件顺序。
+                if (action in FOLLOW_ACTIONS) {
+                    intent.putExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID, newFollowRequestId())
+                }
+            }
+    private val FOLLOW_ACTIONS = setOf(ReadingAudioService.ACTION_PLAY_BOOK,
+        ReadingAudioService.ACTION_TOGGLE, ReadingAudioService.ACTION_NEXT, ReadingAudioService.ACTION_PREVIOUS,
+        ReadingAudioService.ACTION_NEXT_CHAPTER, ReadingAudioService.ACTION_PREVIOUS_CHAPTER)
     internal fun isAuthorizedCommand(intent: Intent): Boolean =
         runCatching { intent.getStringExtra(EXTRA_COMMAND_TOKEN) }.getOrNull() == commandToken
     private fun send(context: Context, action: String, key: String? = null, value: Long = 0) {

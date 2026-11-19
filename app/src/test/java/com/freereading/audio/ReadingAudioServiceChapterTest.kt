@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Looper
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaSession
 import com.freereading.ReadingApplication
 import com.freereading.data.BookRecord
 import com.freereading.data.SpeechBook
@@ -24,6 +25,8 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -93,12 +96,15 @@ class ReadingAudioServiceChapterTest {
         assertTrue(player.playWhenReady)
         assertEquals(0, player.mediaItemCount)
         assertEquals(sessionId, PlaybackHub.state.value.playbackSessionId)
+        val followRequest = PlaybackHub.state.value.followRequestId
+        assertNotNull(followRequest)
         assertEquals(1.25f, player.playbackParameters.speed, 0f)
         await("chosen voice chapter start") { ServiceVoiceTtsShadow.calls.isNotEmpty() }
         assertEquals("句子5。", ServiceVoiceTtsShadow.calls.first().text)
         assertEquals("chosen", ServiceVoiceTtsShadow.calls.first().voice)
 
         pause()
+        assertEquals(followRequest, PlaybackHub.state.value.followRequestId)
         ServiceVoiceTtsShadow.completePending()
         await("new chapter queue") { player.currentMediaItem?.mediaId == "5" }
         assertEquals(0L, player.currentPosition)
@@ -115,6 +121,7 @@ class ReadingAudioServiceChapterTest {
         assertEquals(0, PlaybackHub.state.value.sentenceIndex)
         assertEquals(0L, PlaybackHub.state.value.positionMs)
         assertTrue(player.playWhenReady)
+        assertNotNull(PlaybackHub.state.value.followRequestId)
         assertFalse(PlaybackHub.state.value.canGoToPreviousChapter)
         assertTrue(PlaybackHub.state.value.canGoToNextChapter)
         await("previous chapter text") { ServiceVoiceTtsShadow.calls.isNotEmpty() }
@@ -173,9 +180,11 @@ class ReadingAudioServiceChapterTest {
         nextChapter()
         await("first target") { ServiceVoiceTtsShadow.calls.size == 1 }
         assertEquals(5, PlaybackHub.state.value.sentenceIndex)
+        val firstFollow = PlaybackHub.state.value.followRequestId
 
         nextChapter()
         assertEquals(7, PlaybackHub.state.value.sentenceIndex)
+        assertNotEquals(firstFollow, PlaybackHub.state.value.followRequestId)
         assertFalse(PlaybackHub.state.value.canGoToNextChapter)
         await("second target") { ServiceVoiceTtsShadow.calls.size == 2 }
 
@@ -264,6 +273,40 @@ class ReadingAudioServiceChapterTest {
 
         assertEquals(3, PlaybackHub.state.value.sentenceIndex)
         assertFalse(player.playWhenReady)
+        assertNull(PlaybackHub.state.value.followRequestId)
+    }
+
+    @Test fun explicitSentenceSkipWhilePlayingRequestsFollowAtItsNewTarget() {
+        activeFixture(index = 3)
+        player.playWhenReady = true
+
+        send(PlaybackHub.command(app, ReadingAudioService.ACTION_NEXT))
+
+        assertEquals(4, PlaybackHub.state.value.sentenceIndex)
+        assertTrue(player.playWhenReady)
+        val first = requireNotNull(PlaybackHub.state.value.followRequestId)
+        send(PlaybackHub.command(app, ReadingAudioService.ACTION_PREVIOUS))
+        assertEquals(3, PlaybackHub.state.value.sentenceIndex)
+        assertNotEquals(first, PlaybackHub.state.value.followRequestId)
+    }
+
+    @Test fun retryingAnEmptyQueueRestoresFollowEvenWhenThePreviousPlayIntentWasAlreadyTrue() {
+        activeFixture(index = 3)
+        ReflectionHelpers.setField(service, "transitionToken", -1L)
+        player.clearMediaItems()
+        player.playWhenReady = true
+        drain()
+        ReflectionHelpers.setField(service, "transitionToken", null)
+        val failed = PlaybackHub.state.value.copy(error = "上次准备失败", followRequestId = "failed-start")
+        PlaybackHub.publish(failed)
+        val session: MediaSession = ReflectionHelpers.getField(service, "session")
+
+        session.player.play()
+
+        assertNotEquals(failed.followRequestId, PlaybackHub.state.value.followRequestId)
+        assertEquals(failed.playbackSessionId, PlaybackHub.state.value.playbackSessionId)
+        assertEquals(3, PlaybackHub.state.value.sentenceIndex)
+        assertTrue(player.playWhenReady)
     }
 
     @Test fun stopDuringPreparationClearsChapterCapabilitiesAndLateCallbacksCannotRestoreThem() {

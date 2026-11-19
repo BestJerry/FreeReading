@@ -140,8 +140,9 @@ class ReaderActivity : FragmentActivity() {
     private var showAppearance by mutableStateOf(false)
     private var showReadingControls by mutableStateOf(false)
     private var showListening by mutableStateOf(false)
-    // 用户的长期跟随偏好；手动浏览可临时脱离，但不会关闭此偏好。
+    // 每次明确起播／恢复时开启；本次播放中仍允许关闭或手动浏览暂时脱离。
     private var followAudio by mutableStateOf(true)
+    private var handledFollowRequestId: String? = null
     private var fontScale by mutableStateOf(1.15f)
     private var pageStyle by mutableStateOf("paper")
     private var scroll by mutableStateOf(false)
@@ -175,9 +176,9 @@ class ReaderActivity : FragmentActivity() {
     /** 绑定视觉页与导航代次的可见文本快照，供 WebView 销毁前后的进度保存复用。 */
     private data class VisibleTextSnapshot(val page: Locator, val textAnchor: Locator, val revision: Long)
     /** 仅保留影响原文同步的播放状态，过滤仅句内音频时间变化的重复同步。 */
-    private data class AudioCursor(val bookId: String?, val sentenceIndex: Int,
+    private data class AudioCursor(val bookId: String?, val sentenceIndex: Int, val sentenceCount: Int,
                                    val playing: Boolean, val preparing: Boolean, val sessionId: String?,
-                                   val failedStartId: String?)
+                                   val failedStartId: String?, val followRequestId: String?)
     private var visibleTextSnapshot: VisibleTextSnapshot? = null
 
     private val paper: Color get() = when (pageStyle) {
@@ -193,6 +194,7 @@ class ReaderActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         restoredLocator = savedInstanceState?.getString(STATE_LOCATOR)
         followAudio = savedInstanceState?.getBoolean(STATE_FOLLOW, true) ?: true
+        handledFollowRequestId = savedInstanceState?.getString(STATE_FOLLOW_REQUEST)
         readingPlaybackIntent = savedInstanceState?.getString(STATE_PLAYBACK_INTENT)?.let {
             runCatching { ReadingPlaybackIntent.valueOf(it) }.getOrNull()
         } ?: ReadingPlaybackIntent.CONTINUE_AUDIO
@@ -306,6 +308,7 @@ class ReaderActivity : FragmentActivity() {
         publication = opened
         readingOrderHrefs = opened.readingOrder.map { it.url().removeFragment().toString() }
         val audio = PlaybackHub.state.value
+        restoreFollowForPlaybackStart(audio)
         acknowledgeAudioStart(audio)
         resumableProgress = resolveReadingResumeProgress(record, saved, pendingStoppedProgress,
             audio.bookId, readingPlaybackIntent, cachedBook)
@@ -316,7 +319,7 @@ class ReaderActivity : FragmentActivity() {
                 restoredLocator ?: stoppedLocator
             followingAudio && pendingAudioLocator != null -> pendingAudioLocator
             followingAudio && stoppedLocator != null -> stoppedLocator
-            followingAudio && audio.bookId == bookId ->
+            followingAudio && audio.bookId == bookId && audio.sentenceCount > 0 ->
                 cachedBook?.sentences?.getOrNull(audio.sentenceIndex)?.locatorJson ?: restoredLocator ?: saved.locatorJson
             restoredLocator != null -> restoredLocator
             else -> saved.locatorJson
@@ -498,8 +501,9 @@ class ReaderActivity : FragmentActivity() {
                     try {
                         PlaybackHub.state
                             // 同一句的重新起播或恢复也要追赶原文页，不能只比较句子编号。
-                            .map { AudioCursor(it.bookId, it.sentenceIndex, it.isPlaying, it.isPreparing,
-                                it.playbackSessionId, it.startFailure?.requestId) }
+                            .map { AudioCursor(it.bookId, it.sentenceIndex, it.sentenceCount,
+                                it.isPlaying, it.isPreparing, it.playbackSessionId,
+                                it.startFailure?.requestId, it.followRequestId) }
                             .distinctUntilChanged()
                             .collect { synchronizeAudio() }
                     } finally {
@@ -512,14 +516,32 @@ class ReaderActivity : FragmentActivity() {
 
     /** 按当前朗读句请求更新或清除高亮；开启跟随时请求跳页，执行前仍须通过会话与页面校验。 */
     private fun synchronizeAudio() {
-        val synchronizer = audioHighlighter ?: return
         val audio = PlaybackHub.state.value
+        restoreFollowForPlaybackStart(audio)
         acknowledgeAudioStart(audio)
+        val synchronizer = audioHighlighter ?: return
         val sentence = speechBook?.sentences?.getOrNull(audio.sentenceIndex)
-            ?.takeIf { audio.bookId == bookId }
+            ?.takeIf { audio.bookId == bookId && audio.sentenceCount > 0 }
         val locator = sentence?.locatorJson?.let(::parseLocator)
         val target = locator?.let { AudioHighlightSynchronizer.Target(bookId, audio.sentenceIndex, it) }
         synchronizer.request(target, navigate = followingAudio)
+    }
+
+    /** 消费显式起播事件；不取消正文起播任务，也不从自然换句的播放状态推断恢复跟随。 */
+    private fun restoreFollowForPlaybackStart(audio: PlaybackSnapshot) {
+        val request = audio.followRequestId ?: return
+        if (audio.bookId != bookId || !PlaybackHub.isNewerFollowRequest(request, handledFollowRequestId)) return
+        handledFollowRequestId = request
+        followAudio = true
+        readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
+        requestedReadingStart = null
+        resumableProgress = null
+        pendingStoppedProgress = null
+    }
+
+    /** 手动操作记录提交顺序水位，已提交但尚未被服务接收的旧命令也不能再覆盖这次操作。 */
+    private fun acknowledgeCurrentFollowRequest() {
+        handledFollowRequestId = PlaybackHub.newFollowRequestId()
     }
 
     /** 按请求 ID 确认起播或记录失败；确认之前不让旧播放状态抢回用户选择的页面。 */
@@ -681,6 +703,7 @@ class ReaderActivity : FragmentActivity() {
 
     /** 主动翻页、目录跳转或选文后临时脱离跟随，并将下一次起播改为新阅读位置。 */
     private fun markManualNavigation() {
+        acknowledgeCurrentFollowRequest()
         showReadingControls = false
         cancelReadingStart()
         clearPendingAudioStart()
@@ -692,6 +715,7 @@ class ReaderActivity : FragmentActivity() {
 
     /** 放弃旧阅读定位与失败重试游标，重新跟随当前音频并恢复自动翻页。 */
     private fun followCurrentAudio() {
+        acknowledgeCurrentFollowRequest()
         cancelReadingStart()
         clearPendingAudioStart()
         if (readingPlaybackIntent == ReadingPlaybackIntent.RETRY_AUDIO_START) {
@@ -707,6 +731,7 @@ class ReaderActivity : FragmentActivity() {
     /** 关闭跟随只改变偏好，不改变播放起点；重新开启时请求定位到当前朗读句。 */
     private fun toggleAudioFollow() {
         if (followingAudio) {
+            acknowledgeCurrentFollowRequest()
             followAudio = false
             synchronizeAudio()
         } else {
@@ -839,6 +864,7 @@ class ReaderActivity : FragmentActivity() {
         pendingAudioSentence = progress.sentenceIndex
         pendingAudioRequestId = requestId
         readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
+        followAudio = true
         requestedReadingStart = null
         if (!PlaybackHub.playBook(this, bookId, progress.sentenceIndex, progress.audioOffsetMs, requestId)) {
             audioStartFailed(progress)
@@ -959,6 +985,7 @@ class ReaderActivity : FragmentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString(STATE_LOCATOR, navigator?.currentLocator?.value?.toJSON()?.toString())
         outState.putBoolean(STATE_FOLLOW, followAudio)
+        outState.putString(STATE_FOLLOW_REQUEST, handledFollowRequestId)
         outState.putString(STATE_PLAYBACK_INTENT, readingPlaybackIntent.name)
         outState.putString(STATE_READING_START, requestedReadingStart?.toJSON()?.toString())
         pendingAudioSentence?.let { outState.putInt(STATE_PENDING_AUDIO_SENTENCE, it) }
@@ -1082,7 +1109,7 @@ class ReaderActivity : FragmentActivity() {
         }
     }
 
-    /** 仅对本书有效的相邻章节发送命令，同时作废旧阅读起播查询并保留跟随偏好。 */
+    /** 仅对本书有效的相邻章节发送命令，目标由服务确认后再开启跟随，避免先跳回旧句。 */
     private fun skipListeningChapter(forward: Boolean) {
         val audio = PlaybackHub.state.value
         if (audio.bookId != bookId ||
@@ -1092,7 +1119,6 @@ class ReaderActivity : FragmentActivity() {
         resumableProgress = null
         pendingStoppedProgress = null
         requestedReadingStart = null
-        readingPlaybackIntent = ReadingPlaybackIntent.CONTINUE_AUDIO
         if (forward) PlaybackHub.nextChapter(this, bookId) else PlaybackHub.previousChapter(this, bookId)
     }
 
@@ -1297,6 +1323,7 @@ class ReaderActivity : FragmentActivity() {
         private const val EXTRA_OPEN_PLAYER = "open_player"
         private const val STATE_LOCATOR = "reader_locator"
         private const val STATE_FOLLOW = "reader_follow_audio"
+        private const val STATE_FOLLOW_REQUEST = "reader_follow_request"
         private const val STATE_PLAYBACK_INTENT = "reader_playback_intent"
         private const val STATE_READING_START = "reader_requested_start"
         private const val STATE_PENDING_AUDIO_SENTENCE = "reader_pending_audio_sentence"

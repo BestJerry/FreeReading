@@ -2,6 +2,7 @@ package com.freereading.audio
 
 import android.os.Looper
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaSession
 import com.freereading.ReadingApplication
 import com.freereading.data.BookRecord
 import com.freereading.data.SpeechBook
@@ -9,6 +10,8 @@ import com.freereading.data.SpeechSentence
 import java.util.concurrent.TimeUnit
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -66,7 +69,7 @@ class ReadingAudioServiceStateTest {
     }
 
     @Test fun changingActualPlayerSpeedWhilePreparingPublishesSpeedWithoutChangingTheCursor() {
-        val pending = pendingSnapshot()
+        val pending = pendingSnapshot().copy(followRequestId = "accepted-start")
         PlaybackHub.publish(pending)
         ReflectionHelpers.setField(service, "transitionToken", 8L)
 
@@ -75,6 +78,61 @@ class ReadingAudioServiceStateTest {
 
         assertEquals(1.5f, player.playbackParameters.speed, 0f)
         assertEquals(pending.copy(speed = 1.5f), PlaybackHub.state.value)
+    }
+
+    @Test fun systemMediaResumeRestoresFollowOnceWithoutReplacingTheAcceptedSession() {
+        val accepted = pendingSnapshot().copy(playbackSessionId = PlaybackHub.newPlaybackSessionId(),
+            followRequestId = "previous-start")
+        PlaybackHub.publish(accepted)
+        ReflectionHelpers.setField(service, "transitionToken", 9L)
+        val session: MediaSession = ReflectionHelpers.getField(service, "session")
+
+        session.player.play()
+
+        val resumed = requireNotNull(PlaybackHub.state.value.followRequestId)
+        assertNotEquals(accepted.followRequestId, resumed)
+        assertEquals(accepted.playbackSessionId, PlaybackHub.state.value.playbackSessionId)
+        session.player.play()
+        assertEquals("Duplicate play while preparing is not another start", resumed,
+            PlaybackHub.state.value.followRequestId)
+        session.player.pause()
+        assertEquals(resumed, PlaybackHub.state.value.followRequestId)
+        session.player.playWhenReady = true
+        assertNotEquals(resumed, PlaybackHub.state.value.followRequestId)
+        assertEquals(accepted.playbackSessionId, PlaybackHub.state.value.playbackSessionId)
+    }
+
+    @Test fun miniPlayerToggleRestoresFollowOnResumeAndLeavesPauseAlone() {
+        val accepted = pendingSnapshot().copy(followRequestId = "previous-start")
+        PlaybackHub.publish(accepted)
+        ReflectionHelpers.setField(service, "transitionToken", 10L)
+        val command = PlaybackHub.command(service, ReadingAudioService.ACTION_TOGGLE)
+
+        service.onStartCommand(command, 0, 1)
+
+        val resumed = requireNotNull(PlaybackHub.state.value.followRequestId)
+        assertNotEquals(accepted.followRequestId, resumed)
+        service.onStartCommand(command, 0, 2)
+        assertEquals(resumed, PlaybackHub.state.value.followRequestId)
+    }
+
+    @Test fun aNewBookStartPublishesFollowBeforeTheSavedSentenceIsResolved() {
+        PlaybackHub.publish(pendingSnapshot().copy(followRequestId = "old-start"))
+        val sessionId = PlaybackHub.newPlaybackSessionId()
+
+        ReflectionHelpers.callInstanceMethod<Unit>(service, "playBook",
+            ClassParameter.from(String::class.java, "another-book"),
+            ClassParameter.from(Int::class.javaPrimitiveType, -1),
+            ClassParameter.from(Long::class.javaPrimitiveType, 0L),
+            ClassParameter.from(String::class.java, sessionId),
+            ClassParameter.from(String::class.java, PlaybackHub.newFollowRequestId()))
+
+        val starting = PlaybackHub.state.value
+        assertEquals("another-book", starting.bookId)
+        assertEquals(sessionId, starting.playbackSessionId)
+        assertEquals(0, starting.sentenceCount)
+        assertNotNull(starting.followRequestId)
+        assertNotEquals("old-start", starting.followRequestId)
     }
 
     private fun pendingSnapshot() = PlaybackSnapshot(bookId = "book-a", bookTitle = "测试书籍",

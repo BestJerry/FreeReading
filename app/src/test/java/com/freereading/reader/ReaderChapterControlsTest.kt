@@ -23,7 +23,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter
 
-/** Chapter transport must supersede an older reading lookup without changing follow preference. */
+/** Chapter transport supersedes an older lookup, then follows the service's confirmed new target. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], application = ReadingApplication::class)
 class ReaderChapterControlsTest {
@@ -53,7 +53,7 @@ class ReaderChapterControlsTest {
 
     @Test fun chapterSelectionCancelsAnOlderLookupAndDiscardsItsResumeCursor() {
         val oldCursor = ReadingProgress(bookId, sentenceIndex = 5, audioOffsetMs = 4_000)
-        // Explicitly disabled follow remains disabled after choosing a chapter.
+        // The old audio cursor must not steal the page before the new chapter is published.
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "toggleAudioFollow")
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "markManualNavigation")
         val pending = Job()
@@ -67,7 +67,7 @@ class ReaderChapterControlsTest {
         assertTrue(pending.isCancelled)
         assertNull(ReflectionHelpers.getField<ReadingProgress?>(activity, "resumableProgress"))
         assertNull(ReflectionHelpers.getField<ReadingProgress?>(activity, "pendingStoppedProgress"))
-        assertEquals(ReadingPlaybackIntent.CONTINUE_AUDIO,
+        assertEquals(ReadingPlaybackIntent.FROM_READING_LOCATION,
             ReflectionHelpers.callInstanceMethod<ReadingPlaybackIntent>(activity, "getReadingPlaybackIntent"))
         assertFalse(ReflectionHelpers.callInstanceMethod(activity, "getFollowAudio"))
         val command = shadowOf(app).nextStartedService
@@ -76,6 +76,11 @@ class ReaderChapterControlsTest {
         assertTrue(PlaybackHub.isAuthorizedCommand(requireNotNull(command)))
         assertNull(shadowOf(app).nextStartedService)
         assertFalse(activity.isFinishing)
+
+        PlaybackHub.publish(PlaybackHub.state.value.copy(sentenceIndex = 7, sentenceCount = 10,
+            followRequestId = command.getStringExtra(ReadingAudioService.EXTRA_FOLLOW_REQUEST_ID)))
+        ReflectionHelpers.callInstanceMethod<Unit>(activity, "synchronizeAudio")
+        assertTrue(ReflectionHelpers.callInstanceMethod(activity, "getFollowingAudio"))
     }
 
     @Test fun previousChapterWorksWhileTheDocumentIsLoadingAndPreservesStartAcknowledgement() {
