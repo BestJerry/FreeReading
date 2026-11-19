@@ -4,14 +4,14 @@ FreeReading 是使用 **Kotlin 和 Jetpack Compose** 开发的 Android 原生本
 
 项目仓库：[BestJerry/FreeReading_android](https://github.com/BestJerry/FreeReading_android)。
 
-当前版本：**0.1.10**。支持 **Android 8.0（API 26）及以上**。
+当前版本：**0.1.11**。支持 **Android 8.0（API 26）及以上**。
 
 ## 下载安装
 
-当前测试安装包为 **v0.1.10**。本次完善并核对 45 个业务源码文件的中文注释，阅读与听书功能延续 v0.1.9。
+当前测试安装包为 **v0.1.11**。每次开始或恢复朗读时自动开启“跟随原文”；本次朗读中仍可手动关闭或浏览其他位置，旧播放命令晚到不会覆盖较新的手动操作。
 
-- [下载 v0.1.10 Android APK](https://github.com/BestJerry/FreeReading_android/releases/download/v0.1.10/FreeReading-v0.1.10.apk)
-- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading_android/releases/tag/v0.1.10)
+- [下载 v0.1.11 Android APK](https://github.com/BestJerry/FreeReading_android/releases/download/v0.1.11/FreeReading-v0.1.11.apk)
+- [版本说明与 SHA-256 校验文件](https://github.com/BestJerry/FreeReading_android/releases/tag/v0.1.11)
 
 下载 APK 后，按 Android 系统提示允许该下载来源安装应用，即可安装。当前发布的是 **Debug 签名测试包**；同签名的已有测试版可覆盖安装，保留书架与进度。听书需在系统语音设置中安装对应语言的离线音色。本轮通过本地单测、构建和静态检查，未进行真机复测。
 
@@ -130,6 +130,13 @@ JAVA_HOME=/path/to/jdk17 ./gradlew -Dorg.gradle.java.home=/path/to/jdk17 :app:as
 - `docs/`：故障诊断、修复边界与验证记录。
 
 ## 验证状态
+
+0.1.11 的本地验证：
+
+- 全量 **52 个测试类、531 条测试通过**，无失败、错误或跳过；Debug APK 构建成功，Lint 无错误且警告数量未增加。本轮未操作真机。
+- 起播、恢复、失败重试和章节播放自动开启跟随；自然换句、倍速、音色切换和普通快进快退保留本次播放中的手动关闭。
+- 回归覆盖命令已提交但服务延后接收时手动关闭或浏览原文、后台重绑、页面重建及待确认起播的位置保护。
+- APK 版本为 0.1.11（版本码 12），签名与先前测试版一致，可覆盖安装；发布附件提供 SHA-256 校验文件。
 
 0.1.10 的本地验证：
 
